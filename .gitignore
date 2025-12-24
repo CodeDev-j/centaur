@@ -1,0 +1,58 @@
+# --- Python Standard ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Environment Variables (CRITICAL) ---
+.env
+.env.local
+.env.*
+
+# --- Chiron Data Lake (The "Three Truths") ---
+# We ignore the data, but keep the folder structure if .gitkeep exists
+data/inputs/*
+data/blobs/*
+data/shadow_cache/*
+data/system/*
+
+# --- Docker Persistence ---
+# Ignore the actual DB files mounted by Docker
+data/postgres_data/
+data/qdrant_data/
+
+# --- IDEs & OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Testing & Logs ---
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+celerybeat-schedule
+
+# --- Jupyter ---
+.ipynb_checkpoints

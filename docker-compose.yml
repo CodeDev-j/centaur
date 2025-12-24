@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # 1. The Vector Database (Search Truth)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: chiron_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./data/qdrant_storage:/qdrant/storage
+    restart: always
+
+  # 2. The SQL Database (State Truth)
+  postgres:
+    image: postgres:15
+    container_name: chiron_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: chiron_ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres_data:/var/lib/postgresql/data
+    restart: always

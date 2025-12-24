@@ -1,0 +1,36 @@
+# --- CORE SYSTEM ---
+python-dotenv~=1.0.1
+pydantic~=2.7.0
+numpy<2.0.0
+aiofiles~=23.2.1
+
+# --- STORAGE LAYER (Docker & Blobs) ---
+SQLAlchemy~=2.0.30
+psycopg2-binary~=2.9.9
+
+# --- LAYER 1: INGESTION (Local Body) ---
+# We allow Docling to float to the latest stable version to get SOTA fixes
+docling>=2.5.0
+markitdown~=0.0.1
+playwright~=1.44.0
+Pillow~=10.3.0
+openpyxl~=3.1.2
+
+# --- LAYER 2: RETRIEVAL (Local Sidecar) ---
+qdrant-client>=1.9.0
+# [FIXED] Bumped to 0.4.1 to resolve HuggingFace Hub conflict with Docling
+fastembed>=0.4.1
+
+# --- LAYER 3: INTELLIGENCE (Cloud Brain) ---
+# LangGraph moves fast; we pin to ensure graph.py compatibility
+langgraph~=0.0.50
+langchain~=0.2.0
+langchain-community~=0.2.0
+langchain-openai~=0.1.7
+litellm~=1.38.0
+openai>=1.30.0
+
+# --- OBSERVABILITY & UTILS ---
+langsmith~=0.1.50
+pandas~=2.2.2
+jupyterlab~=4.2.0
