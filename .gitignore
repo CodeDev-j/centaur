@@ -30,8 +30,10 @@ wheels/
 
 # --- Chiron Data Lake (The "Three Truths") ---
 # We ignore the data, but keep the folder structure if .gitkeep exists
-data/inputs/*
 data/blobs/*
+data/inputs/*
+data/postgres_data/*
+data/qdrant_storage/*
 data/shadow_cache/*
 data/system/*
 
