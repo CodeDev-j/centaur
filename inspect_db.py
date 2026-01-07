@@ -13,8 +13,8 @@ DB_URL = "http://localhost:6333"
 COLLECTION_NAME = "chiron_knowledge_base"
 
 # Defaults
-DEFAULT_FILENAME = "Alphabet_2025.Q1_Earnings.Slides.pdf"
-DEFAULT_PAGE = 5
+DEFAULT_FILENAME = "Alphabet_2025.Q1_Earnings.Slides - Copy-06.pdf"
+DEFAULT_PAGE = 1
 # ==============================================================================
 
 # Configure logging to only show errors, keeping stdout clean for our tool
@@ -126,8 +126,8 @@ class DBInspector:
             raw_text = p.get("text", "")
             print("\nCONTENT:")
             print("=" * 60)
-            print(textwrap.fill(raw_text[:500], width=80)) # Limit to 500 chars for sanity
-            if len(raw_text) > 500:
+            print(textwrap.fill(raw_text[:2000], width=80)) # Limit chars for sanity
+            if len(raw_text) > 2000:
                 print("... [truncated]")
             print("=" * 60 + "\n")
 

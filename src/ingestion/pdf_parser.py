@@ -33,29 +33,26 @@ def classify_region(text_items: List[Dict[str, Any]]) -> Dict[str, Any]:
     Source: Gemini Deep Thinking Strategy.
     """
     if not text_items:
-        return {"classification": "Unknown", "score": 0}
+        # Default to chart if no text found but it was a visual crop
+        return {"classification": "chart", "score": 0, "debug": "No overlapping text"}
 
-    # 1. Pre-Computation
     full_text = " ".join([item['text'] for item in text_items])
     tokens = re.findall(r'\w+', full_text.lower())
     total_tokens = len(tokens) if tokens else 1
     total_chars = len(full_text.replace(" ", ""))
 
-    # 2. Features
-    
-    # A. Stopwords (Linguistic) - Text blocks use grammar, charts don't.
+    # Features
     STOPWORDS = {'the', 'and', 'of', 'to', 'in', 'is', 'for', 'with', 'on', 'as', 'by', 'at', 'from', 'be', 'are', 'due', 'approximately'}
     stopword_count = sum(1 for t in tokens if t in STOPWORDS)
     stopword_ratio = stopword_count / total_tokens
 
-    # B. Data Density (Linguistic) - Digits & Symbols
     data_chars = sum(1 for c in full_text if c.isdigit() or c in "$%()€£")
     data_density = data_chars / total_chars if total_chars > 0 else 0
 
-    # C. Alignment (Geometric) - Vertical Grid check
+    # Strong Signal: Currency format ($XX,XXX)
+    has_financials = bool(re.search(r'\$\d{1,3}(?:,\d{3})*(?:\.\d+)?', full_text))
+
     x0_coords = [item['bbox'][0] for item in text_items]
-    x1_coords = [item['bbox'][2] for item in text_items]
-    
     def get_align_ratio(coords, tol=5.0):
         if len(coords) < 2: return 0
         aligned = 0
@@ -63,31 +60,34 @@ def classify_region(text_items: List[Dict[str, Any]]) -> Dict[str, Any]:
             if any(abs(c1 - c2) <= tol for j, c2 in enumerate(coords) if i != j):
                 aligned += 1
         return aligned / len(coords)
+    align_score = get_align_ratio(x0_coords)
+    
+    # Average Token Length (Text uses long words like "significant"; Charts use "Q1")
+    avg_len = sum(len(t) for t in tokens) / total_tokens
 
-    align_score = max(get_align_ratio(x0_coords), get_align_ratio(x1_coords))
-
-    # 3. Scoring
+    # --- SCORING LOGIC (TUNED) ---
     score = 0.0
     
-    # Rule 1: Stopwords (Strong Negative) - The "Key Highlights" Killer
-    if stopword_ratio > 0.15: score -= 50
-    elif stopword_ratio < 0.05: score += 20
+    # 1. Linguistic Penalties (The "Text" Defenders)
+    if stopword_ratio > 0.10: score -= 50   # Sentence structure detected
+    elif stopword_ratio < 0.05: score += 20 # Telegraphic/Label style
+    
+    if avg_len > 6.0: score -= 20           # Long words -> Text Block
 
-    # Rule 2: Alignment (Strong Positive) - Charts use grids
-    if align_score > 0.50: score += 30
+    # 2. Geometric Bonuses (The "Chart" Attackers)
+    if align_score > 0.40: score += 30      # Grid structure
+    if data_density > 0.30: score += 25     # Number heavy
+    
+    # 3. The Financial Tie-Breaker (Reduced from 40 to 20)
+    # This ensures a "$" can't overcome a high stopword count (-50) on its own.
+    if has_financials: score += 20
 
-    # Rule 3: Data Density (Moderate Positive)
-    if data_density > 0.30: score += 25
-    elif data_density < 0.10: score -= 10
-
-    # Rule 4: Token Length (Nuance) - "Q1" vs "Synergies"
-    avg_len = sum(len(t) for t in tokens) / total_tokens
-    if avg_len < 4.5: score += 10
+    classification = "chart" if score > 0 else "general"
     
     return {
-        "classification": "chart" if score > 0 else "general",
+        "classification": classification,
         "score": score,
-        "debug": f"StopWord:{stopword_ratio:.2f}, Dens:{data_density:.2f}, Align:{align_score:.2f}"
+        "debug": f"StopWord:{stopword_ratio:.2f}, AvgLen:{avg_len:.1f}, Align:{align_score:.2f}, HasFin:{has_financials}"
     }
 
 # ==============================================================================
@@ -168,55 +168,83 @@ class PDFParser:
             page_ref = doc.pages[page_no].image
             if not page_ref or not page_ref.pil_image: return None
             page_img = page_ref.pil_image
-                
-            # Robust Crop
+            
+            # Coordinate Fix
+            pdf_w = doc.pages[page_no].size.width
+            pdf_h = doc.pages[page_no].size.height
+            img_w, img_h = page_img.size
+            scale_x = img_w / pdf_w
+            scale_y = img_h / pdf_h
+            
             bbox = prov.bbox
-            x0, x1 = min(bbox.l, bbox.r), max(bbox.l, bbox.r)
-            y0, y1 = min(bbox.t, bbox.b), max(bbox.t, bbox.b)
-            crop_box = (math.floor(max(0, x0)), math.floor(max(0, y0)), 
-                        math.ceil(min(page_img.size[0], x1)), math.ceil(min(page_img.size[1], y1)))
+            pdf_y0 = min(bbox.b, bbox.t)
+            pdf_y1 = max(bbox.b, bbox.t)
             
-            if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]: return None
+            px_x0 = bbox.l * scale_x
+            px_x1 = bbox.r * scale_x
+            px_y0 = pdf_y0 * scale_y
+            px_y1 = pdf_y1 * scale_y
+            
+            # PADDING INCREASED TO 100px
+            PAD = 100
+            crop_box = (
+                math.floor(max(0, px_x0 - PAD)), 
+                math.floor(max(0, px_y0 - PAD)), 
+                math.ceil(min(img_w, px_x1 + PAD)), 
+                math.ceil(min(img_h, px_y1 + PAD))
+            )
+            # Flip Check
+            if crop_box[3] <= crop_box[1]:
+                 crop_box = (
+                    math.floor(max(0, px_x0 - PAD)), 
+                    math.floor(max(0, img_h - px_y1 - PAD)), 
+                    math.ceil(min(img_w, px_x1 + PAD)), 
+                    math.ceil(min(img_h, img_h - px_y0 + PAD))
+                )
+
             cropped_img = page_img.crop(crop_box)
-            
             chunk_id = str(uuid4())
             img_filename = f"{chunk_id}.png"
             cropped_img.save(SystemPaths.LAYOUTS / img_filename)
             
-            # --- HARVEST OCR & CLASSIFY ---
+            # Harvest OCR
             classifier_items = []
             ocr_text_list = []
             
             for text_item, _ in doc.iterate_items():
                 if not text_item.prov or text_item.prov[0].page_no != page_no: continue
-                
-                # Check Overlap with 5px buffer
+                if not hasattr(text_item, "text") or not text_item.text.strip(): continue
+
                 t_bbox = text_item.prov[0].bbox
-                tx0, tx1 = min(t_bbox.l, t_bbox.r), max(t_bbox.l, t_bbox.r)
-                ty0, ty1 = min(t_bbox.t, t_bbox.b), max(t_bbox.t, t_bbox.b)
-                t_center_x, t_center_y = (tx0 + tx1)/2, (ty0 + ty1)/2
+                tx_center = (t_bbox.l + t_bbox.r) / 2
+                ty_center = (t_bbox.t + t_bbox.b) / 2
                 
-                if (x0-5 <= t_center_x <= x1+5) and (y0-5 <= t_center_y <= y1+5):
+                # Logic Buffer (Same as PAD)
+                if (bbox.l - 60 <= tx_center <= bbox.r + 60) and \
+                   (min(bbox.t, bbox.b) - 60 <= ty_center <= max(bbox.t, bbox.b) + 60):
+                    
                     txt = text_item.text.strip()
                     ocr_text_list.append(txt)
-                    classifier_items.append({'text': txt, 'bbox': [tx0, ty0, tx1, ty1]})
+                    classifier_items.append({'text': txt, 'bbox': [t_bbox.l, t_bbox.b, t_bbox.r, t_bbox.t]})
 
-            # Run the Voting System
+            # Routing
             classification_result = classify_region(classifier_items)
             mode = classification_result["classification"]
             
-            # Hybrid override: If Docling is certain it's a chart, and our classifier is ambivalent, trust Docling
-            if "chart" in item.label.value and mode == "general":
-                if classification_result['score'] > -15: mode = "chart"
+            # Ultimate Override: If Visual Label + Financial Score > -20, force Chart
+            labels = item.label.value.lower()
+            is_visual_label = any(x in labels for x in ["chart", "figure", "picture"])
+            
+            if is_visual_label and (classification_result['score'] > -20): 
+                mode = "chart"
 
             ocr_context = " | ".join(ocr_text_list) if ocr_text_list else "No text detected."
             color_context = self._scan_for_legend_colors(cropped_img) if mode == "chart" else "N/A"
 
-            # Call Vision Tool
             description = vision_tool.analyze(
                 file_name=img_filename, 
                 mode=mode, 
-                context=f"OCR ({mode.upper()}): {ocr_context}\nSTATS: {classification_result['debug']}\nCOLORS: {color_context}"
+                context=f"OCR ({mode.upper()}): {ocr_context}\nSTATS: {classification_result.get('debug', 'N/A')}\nCOLORS: {color_context}"
             )
             
             return IngestedChunk(
@@ -249,6 +277,7 @@ class PDFParser:
 
     def _scan_for_legend_colors(self, image: Image.Image) -> str:
         w, h = image.size
+        if w < 50 or h < 50: return "Image too small for color scan."
         zones = [("Left", image.crop((0, 0, min(30, w), h))), ("Right", image.crop((max(0, w-30), 0, w, h))), ("Bottom", image.crop((0, max(0, h-30), w, h)))]
         found_colors = []
         for name, zone in zones:

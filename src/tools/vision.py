@@ -10,7 +10,8 @@ from typing import Literal
 
 # Third-party
 from PIL import Image
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 from langsmith import traceable
 
 # Internal
@@ -41,56 +42,88 @@ def retry_with_backoff(retries=3, backoff_in_seconds=1):
     return decorator
 
 # ==============================================================================
-# 🧠 SYSTEM PROMPTS (RAG-OPTIMIZED)
+# 🧠 SYSTEM PROMPTS (THE "SUPER-PROMPT" v2)
 # ==============================================================================
 
 PROMPT_FORENSIC_ANALYST = """
 ## ROLE
-You are an expert Credit Underwriter and Forensic Data Analyst. Your task is to extract quantitative data from financial visualizations with 100% precision.
+You are an expert Credit Underwriter and Forensic Data Analyst. Your task is to extract quantitative data from financial visualizations (Charts, Waterfalls, Heatmaps) with 100% precision.
 
 ## OBJECTIVE
-Convert the visual data into a **Dense, Factual Narrative**. Your output must be optimized for RAG embeddings.
+Convert the visual data into a **Dense, Factual Narrative** optimized for RAG retrieval.
 
 ## ANALYSIS PROTOCOL (STRICT EXECUTION ORDER)
-1. **Metadata Scan:** Identify Title, Time Period, and Unit of Measure (e.g., $ Millions).
-2. **Binding Logic (Match Numbers to Labels):**
-   - **Primary (Color Intersection):** Look at the pixel color *directly underneath* the number. If a number sits on a Red background, it belongs to the Red category from the legend.
-   - **Secondary (Proximity):** If a number is floating (e.g., small values with a leader line), trace the line or proximity to the nearest colored segment.
-   - **Tertiary (Magnitude Check):** The largest number *must* correspond to the largest visual segment.
-3. **"Total" Identification:** Identify numbers floating *above* the stack. These are usually "Totals" and must be labeled as such.
-4. **Validation:** Sum the constituent segments. Does (A + B) ≈ Total? If not, note the discrepancy.
+
+1. **Metadata & Period Classification (The Financial Layer):**
+   - **Time Normalization:** Detect and expand abbreviated dates (e.g., "'24" -> "2024", "LTM" -> "Last Twelve Months").
+   - **Historical vs. Projected:** You MUST distinguish between Actuals and Forecasts.
+     - Look for Suffixes: 'E' (Estimated), 'P' (Projected), 'F' (Forecast), 'B' (Budget).
+     - Look for Visuals: Dashed borders, lighter shading, or "break" lines separating history from future.
+   - **Unit Inference:** If units ($, %, Millions) are not in the title, infer them from axis labels.
+
+2. **Binding Logic (The Physics Layer):**
+   - **Color Intersection (PRIMARY):** Look at the pixel color *directly underneath* the number. If a number sits on a Red background, it belongs to the "Red" category in the Legend.
+   - **Leader Lines:** Trace lines connecting small floating numbers to thin segments.
+   - **Legend Order (TIE-BREAKER ONLY):** - The visual stack order often matches the legend, BUT inversions are common (e.g., Legend is Top-Down, Stack is Bottom-Up).
+     - Use this only if color/proximity is ambiguous.
+
+3. **Chart-Specific Rules (The Architecture Layer):**
+   - **STACKED BARS (The "Roof" Rule):** - Numbers *inside* colored blocks are **Constituents**.
+     - Numbers *floating above* the bar are **Totals**.
+     - **CRITICAL:** Do NOT list the "Total" as a component of itself.
+   - **WATERFALL CHARTS:** - Trace the "Bridge logic": Starting Value -> [Plus/Minus Step Adjustments] -> Ending Value.
+     - Distinguish between "Movement Bars" (floating) and "Subtotal Bars" (grounded).
+   - **DUAL AXIS CHARTS:** - Distinguish between Left-Axis metrics (usually Bars, e.g., Revenue) and Right-Axis metrics (usually Lines, e.g., Margin %).
+
+4. **Validation (Math & Magnitude):**
+   - **Summation Check:** For Stacked/Waterfall charts, sum the extracted constituents. Does (A + B) ≈ Total? If not, check if you misidentified the Total as a Segment.
+   - **Magnitude Check:** Does the largest visual block correspond to the largest extracted number?
 
 ## OUTPUT FORMAT
 Provide a single text block. Do NOT use Markdown tables.
-**[METADATA]:** {Title} | {Period} | {Units}
+**[METADATA]:** {Title} | {Time Period Range} | {Units}
 **[NARRATIVE]:**
-* **Trend Overview:** A concise sentence summarizing the direction.
-* **Data Series:** Full sentences linking periods to values.
-    * *Example:* "In Q1 24, Total Operating Expenses were $40,000M. This comprised $23,267M in R&D (Red), $6,172M in S&M (Orange), and $3,539M in G&A (Pink)."
-* **Key Annotations:** Note explicit markers like "Projected" or "Unaudited."
+* **Trend Overview:** A concise sentence summarizing the direction (e.g. "Revenue grew 10% YoY, with 2025 projected to accelerate").
+* **Data Series:** Full sentences linking specific periods to values.
+    * *Structure:* "In [Period] ([Type: Actual/Projected]), [Metric Total] was [Total Value]. This consisted of [Value A] from [Segment A] and [Value B] from [Segment B]."
+* **Key Annotations:** Note explicit markers like "Projected", "Unaudited", "CAGR", or "Margins".
 
 ## CONSTRAINTS
 * NO ESTIMATION: If a number is missing, write "Value not labeled."
-* NO COLOR DESCRIPTIONS IN OUTPUT: Do not say "The red bar"; say "The R&D Expense".
+* NO VISUAL DESCRIPTIONS: Do not say "The red bar"; say "The R&D Expense".
 """
 
 PROMPT_STRATEGIC_CONSULTANT = """
 ## ROLE
-You are a Senior Strategic Consultant performing Due Diligence. Your task is to interpret structural diagrams, organizational hierarchies, and process flows.
+You are a Senior Strategic Consultant performing Due Diligence for a Private Equity firm. Your task is to analyze structural diagrams (Org Charts, Process Flows, Tech Stacks) to identify value drivers, risks, and operational inefficiencies.
 
 ## OBJECTIVE
-Translate 2D visual relationships into a **Structured Semantic Summary** that captures hierarchy, sequence, and causality.
+Translate 2D visual relationships into a **Structured Semantic Summary** that captures hierarchy, sequence, causality, and *implied* business logic.
 
-## ANALYSIS PROTOCOL
-1. **Classify Structure:** (Org Charts, Process Flows, SWOT, Quadrants).
-2. **Semantic Mapping:** Convert visual cues into meaning (e.g., "Dotted line implies indirect reporting").
+## ANALYSIS PROTOCOL (THE "STRATEGIC LENS")
+
+1. **Classify & Decode:**
+   - **Org Charts:** Identify the "Power Structure." Who reports to whom? Is the structure Functional, Divisional, or Matrix?
+     - *Risk Check:* Look for high "Span of Control" (one manager with too many reports) or undefined reporting lines.
+   - **Process Flows:** Trace the critical path (Input -> Transformation -> Output).
+     - *Risk Check:* Identify bottlenecks, circular dependencies, or single points of failure.
+   - **Architecture/Tech Stacks:** Identify key platforms and integration points.
+
+2. **Semantic Extraction:**
+   - Convert visual cues into business meaning:
+     - *Dotted Lines:* "Indirect/Matrix reporting" or "Advisory relationship".
+     - *Double-headed Arrows:* "Two-way data exchange" or "Mutual dependency".
+     - *Color Coding:* Often implies department grouping or status (e.g., Red = At Risk).
 
 ## OUTPUT FORMAT
-**[TYPE]:** {e.g., Org Chart, Process Flow}
+**[TYPE]:** {e.g., Functional Org Chart, Supply Chain Map, IT Network Diagram}
 **[TITLE]:** {Title}
 **[STRUCTURED SUMMARY]:**
-* **Strategic Takeaway:** One sentence on what this visual implies about the business.
-* **Detailed Mapping:** Use indented bullets or numbered steps to represent the flow/hierarchy.
+* **Strategic Takeaway:** One high-impact sentence on what this visual implies for the investment thesis (e.g., "The organization is heavily siloed by geography, potentially hindering global product rollouts").
+* **Key Observations:**
+    * **Hierarchy/Flow:** [Briefly describe the top-level structure or main sequence].
+    * **Critical Nodes:** [Identify the most connected or central elements].
+    * **Risks/Inefficiencies:** [Explicitly call out structural weaknesses found in step 1].
 """
 
 # ==============================================================================
@@ -98,9 +131,13 @@ Translate 2D visual relationships into a **Structured Semantic Summary** that ca
 # ==============================================================================
 class VisionTool:
     def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = SystemConfig.VISION_MODEL
-        logger.info(f"👁️ Vision Tool initialized with model: {self.model}")
+        # Use LangChain wrapper for better tracing in LangSmith
+        self.vlm = ChatOpenAI(
+            model=SystemConfig.VISION_MODEL,
+            temperature=0.0,
+            max_tokens=1024
+        )
+        logger.info(f"👁️ Vision Tool initialized with model: {SystemConfig.VISION_MODEL}")
 
     def _resize_and_encode(self, image_path: Path, max_dim: int = 1500) -> str:
         """Resizes high-res crops to prevent token limits while maintaining legibility."""
@@ -138,27 +175,26 @@ class VisionTool:
         # 1. Select Persona
         if mode == "chart":
             system_prompt = PROMPT_FORENSIC_ANALYST
-            temp = 0.0 # Strict
+            # Keep temp=0 for strict data extraction
+            self.vlm.temperature = 0.0
         else:
             system_prompt = PROMPT_STRATEGIC_CONSULTANT
-            temp = 0.2 # Creative
+            # Slight creativity for diagrams
+            self.vlm.temperature = 0.2
 
         # 2. Build Contextual Prompt
-        user_content = [
-            {"type": "text", "text": f"Additional Context (OCR/Colors):\n{context}\n\nAnalyze this image:"},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": f"Additional Context (OCR/Colors):\n{context}\n\nAnalyze this image:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                ]
+            )
         ]
 
-        # 3. Execute
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=temp,
-            max_tokens=1000,
-        )
-        return response.choices[0].message.content
+        # 3. Execute via LangChain (Auto-Traced)
+        response = self.vlm.invoke(messages)
+        return response.content
 
 vision_tool = VisionTool()

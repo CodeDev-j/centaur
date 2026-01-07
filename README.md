@@ -1,4 +1,4 @@
-# CHIRON: High-Fidelity Underwriting RAG
+# CENTAUR: High-Fidelity Underwriting RAG
 
 **Status:** Alpha (Ingestion Engine Active)  
 **Core Philosophy:** The "Centaur" Architecture (Local Body / Cloud Brain)  
@@ -8,7 +8,7 @@
 
 ## 🏛️ Executive Summary
 
-**Chiron** is a specialized Retrieval-Augmented Generation (RAG) engine designed for **Private Credit Underwriting**. Unlike generic chat bots, Chiron treats credit agreements, indentures, and financial models as structured databases, not unstructured text.
+**Centaur** is a specialized Retrieval-Augmented Generation (RAG) engine designed for **Private Credit Underwriting**. Unlike generic chat bots, Centaur treats credit agreements, indentures, and financial models as structured databases, not unstructured text.
 
 The system is engineered to solve the **"Trust Gap"** in financial AI by enforcing three non-negotiable standards:
 1.  [cite_start]**Pixel-Perfect Grounding:** Every generated answer must point to verifiable coordinates (visual or native) in the source document[cite: 9, 52].
@@ -19,7 +19,7 @@ The system is engineered to solve the **"Trust Gap"** in financial AI by enforci
 
 ## 🏗️ The "Centaur" Architecture
 
-[cite_start]Chiron operates on a hybrid "Body/Brain" model to balance cost and precision[cite: 307].
+[cite_start]Centaur operates on a hybrid "Body/Brain" model to balance cost and precision[cite: 307].
 
 ### 1. The Dual-Helix Ingestion Pipeline
 We reject the "one-size-fits-all" ingestion approach. [cite_start]Files are routed based on their semantic structure[cite: 450, 451].
@@ -47,7 +47,7 @@ graph TD
 ```
 
 ### 2. The Storage Layer: "The Three Truths"
-[cite_start]To prevent "Metadata Bloat" in the Vector DB and ensure data integrity, Chiron decouples storage into three distinct layers[cite: 535, 562].
+[cite_start]To prevent "Metadata Bloat" in the Vector DB and ensure data integrity, Centaur decouples storage into three distinct layers[cite: 535, 562].
 
 | Layer | Component | Role | Why? |
 | :--- | :--- | :--- | :--- |
@@ -68,7 +68,7 @@ graph TD
 [cite_start]This structure is designed to facilitate a seamless migration to Azure[cite: 323].
 
 ```text
-chiron/
+centaur/
 ├── data/                       # [SINGLE SOURCE OF TRUTH]
 │   ├── inputs/                 # Drop zone for raw PDFs/Excel
 │   ├── system/                 # The State Truth (Dev mode hook)
