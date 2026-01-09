@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # 1. The Vector Database (Search Truth)
   qdrant:

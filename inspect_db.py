@@ -13,7 +13,7 @@ DB_URL = "http://localhost:6333"
 COLLECTION_NAME = "chiron_knowledge_base"
 
 # Defaults
-DEFAULT_FILENAME = "Alphabet_2025.Q1_Earnings.Slides - Copy-06.pdf"
+DEFAULT_FILENAME = "Alphabet_2025.Q1_Earnings.Slides - Copy-05.pdf"
 DEFAULT_PAGE = 1
 # ==============================================================================
 
@@ -123,7 +123,7 @@ class DBInspector:
             print(json.dumps(display_meta, indent=4))
 
             # Content Preview
-            raw_text = p.get("text", "")
+            raw_text = p.get("clean_text") or p.get("text") or ""
             print("\nCONTENT:")
             print("=" * 60)
             print(textwrap.fill(raw_text[:2000], width=80)) # Limit chars for sanity

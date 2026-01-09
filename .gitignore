@@ -29,18 +29,32 @@ wheels/
 .env.*
 
 # --- Chiron Data Lake (The "Three Truths") ---
-# We ignore the data, but keep the folder structure if .gitkeep exists
-data/blobs/*
-data/inputs/*
-data/postgres_data/*
-data/qdrant_storage/*
-data/shadow_cache/*
-data/system/*
+# Ignore the actual data, but keep the folder structure
+# (Requires you to run 'touch data/blobs/.gitkeep' etc.)
 
-# --- Docker Persistence ---
-# Ignore the actual DB files mounted by Docker
-data/postgres_data/
-data/qdrant_data/
+# 1. Inputs
+data/inputs/*
+!data/inputs/.gitkeep
+
+# 2. Content Truth (Blobs)
+data/blobs/*
+!data/blobs/.gitkeep
+
+# 3. State Truth (Postgres Mount)
+data/postgres_data/*
+!data/postgres_data/.gitkeep
+
+# 4. Search Truth (Qdrant Mount)
+data/qdrant_storage/*
+!data/qdrant_storage/.gitkeep
+
+# 5. Visual Truth (Shadow Cache)
+data/shadow_cache/*
+!data/shadow_cache/.gitkeep
+
+# 6. System
+data/system/*
+!data/system/.gitkeep
 
 # --- IDEs & OS ---
 .idea/
