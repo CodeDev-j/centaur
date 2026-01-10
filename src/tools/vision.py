@@ -1,11 +1,12 @@
 import base64
 import io
+import json
 import logging
 import asyncio
 import random
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 # Third-party
 from PIL import Image, ImageEnhance
@@ -18,7 +19,7 @@ from src.config import SystemConfig
 
 logger = logging.getLogger(__name__)
 
-# Dedicated thread pool for CPU-bound image operations to avoid blocking the Event Loop
+# Dedicated thread pool for CPU-bound image operations
 _IMG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 def async_retry_with_backoff(retries=3, backoff_in_seconds=1):
@@ -32,9 +33,8 @@ def async_retry_with_backoff(retries=3, backoff_in_seconds=1):
                 except Exception as e:
                     if x == retries:
                         logger.error(f"Failed after {retries} retries: {e}")
-                        return f"[Error: Vision Analysis Failed - {str(e)}]"
+                        return [] if "detect" in func.__name__ else f"[Error: Vision Analysis Failed - {str(e)}]"
                     
-                    # [FIX] Non-blocking sleep allows other tasks to run during backoff
                     sleep_time = (backoff_in_seconds * 2 ** x) + random.uniform(0, 1)
                     logger.warning(f"Vision Error: {e}. Retrying in {sleep_time:.2f}s...")
                     await asyncio.sleep(sleep_time)
@@ -45,6 +45,33 @@ def async_retry_with_backoff(retries=3, backoff_in_seconds=1):
 # ==============================================================================
 # 🧠 SYSTEM PROMPTS (THE "HYBRID" MODEL)
 # ==============================================================================
+
+PROMPT_SCOUT = """
+## ROLE
+You are a Layout Detection Engine for Financial Documents.
+Your goal is to identify **Data Visualizations** that require complex visual interpretation.
+
+## TASK
+Return a JSON object containing a list of regions.
+Format: `{"regions": [{"label": "string", "box_2d": [ymin, xmin, ymax, xmax]}]}`
+Coordinates: 0-1000 Normalized (Top-Left origin).
+
+## CLASSIFICATION LABELS
+1. **"Chart":** Quantifiable plots (Bar, Line, Pie, Area, Waterfall, Scatter).
+   - *Include:* The chart title, axis labels, legend, and footnotes relative to the chart.
+2. **"Table_Image":** dense financial tables that are effectively images (Heatmaps, Harvey Balls, RAG Status Grids).
+   - *Ignore:* Standard text tables (these are handled by a text parser). Only select tables with visual indicators (colors/icons).
+3. **"Diagram":** Structural visuals (Org Charts, Process Flows, Timelines with arrows, Flywheels).
+
+## EXCLUSION RULES (CRITICAL)
+- **DO NOT DETECT:** Simple "Key Stat" rows (e.g., a big "$50M" text). These are text, not charts.
+- **DO NOT DETECT:** Generic stock photos or decorative icons without data.
+- **DO NOT DETECT:** Page headers, footers, or slide titles (unless part of a chart group).
+
+## GROUPING LOGIC
+- **Atomic Units:** If a slide has 3 distinct bar charts, return 3 separate boxes. Do NOT draw one big box around all of them.
+- **completeness:** Ensure the box encompasses the *entire* semantic unit (Title + Plot + Legend).
+"""
 
 PROMPT_FORENSIC_ANALYST = """
 ## ROLE
@@ -148,47 +175,51 @@ Translate 2D visual relationships into a **Structured Semantic Summary** that ca
 # ==============================================================================
 class VisionTool:
     def __init__(self):
-        # Use LangChain wrapper for better tracing in LangSmith
-        self.vlm = ChatOpenAI(
-            model=SystemConfig.VISION_MODEL,
-            temperature=0.0,
-            max_tokens=1024,
+        # 1. The Scout (Fast, Structural) - Uses gpt-4o-mini
+        self.router = ChatOpenAI(
+            model="gpt-4o-mini", 
+            temperature=0.0, 
+            max_tokens=1000, 
+            model_kwargs={"response_format": {"type": "json_object"}}
+        )
+        # 2. The Analyst (High-Res, Forensic) - Uses Config Model (e.g. gpt-4o)
+        self.analyst = ChatOpenAI(
+            model=SystemConfig.VISION_MODEL, 
+            temperature=0.0, 
+            max_tokens=2000,
             # Ensure timeout to prevent hanging connections
             request_timeout=60
         )
-        logger.info(f"👁️ Vision Tool initialized with model: {SystemConfig.VISION_MODEL}")
+        logger.info(f"👁️ Vision Tool initialized. Scout: gpt-4o-mini | Analyst: {SystemConfig.VISION_MODEL}")
 
-    def _process_image_bytes(self, img_bytes: bytes, max_dim: int = 2000) -> str:
+    def _process_image_bytes(self, img_bytes: bytes, max_dim: int = 3000, enhance: bool = True) -> str:
         """
         CPU-bound processing: Resize, Enhance, and Encode to JPEG.
         Executed in a thread pool to avoid blocking the async event loop.
+        - Pass 1 (Scout) uses max_dim=1000, enhance=False for speed.
+        - Pass 2 (Analyst) uses max_dim=3000, enhance=True for precision.
         """
         try:
             with Image.open(io.BytesIO(img_bytes)) as img:
                 # 1. Handle Transparency (Safety for RGBA -> JPEG)
                 if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
                     bg = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode != 'RGBA':
-                        img = img.convert('RGBA')
+                    if img.mode != 'RGBA': img = img.convert('RGBA')
                     bg.paste(img, mask=img.split()[3])
                     img = bg
                 else:
                     img = img.convert('RGB')
 
-                # 2. Boost Contrast (Helps separate light bars/gridlines from white background)
-                # Factor 1.4 = +40% Contrast
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(1.4) 
-                
-                # 3. Boost Sharpness (Helps OCR read small axis labels)
-                # Factor 1.5 = +50% Sharpness
-                enhancer = ImageEnhance.Sharpness(img)
-                img = enhancer.enhance(1.5)
-                # ---------------------------------
+                if enhance:
+                    # 2. Boost Contrast (Helps separate light bars/gridlines from white background)
+                    enhancer = ImageEnhance.Contrast(img)
+                    img = enhancer.enhance(1.4)
+                    
+                    # 3. Boost Sharpness (Helps OCR read small axis labels)
+                    enhancer = ImageEnhance.Sharpness(img)
+                    img = enhancer.enhance(1.5)
 
                 # Standard Resize Logic
-                # [FIX] INCREASED MAX_DIM TO 3000
-                # Previous 1500 limit was shrinking the 3x scaled images, causing fuzziness.
                 width, height = img.size
                 if max(width, height) > max_dim:
                     ratio = max_dim / max(width, height)
@@ -202,41 +233,70 @@ class VisionTool:
             logger.error(f"Image processing failed: {e}")
             raise
 
-    @traceable(name="Vision Analysis", run_type="tool")
-    @async_retry_with_backoff(retries=3)
-    async def analyze(self, image_data: bytes, mode: str = "general", context: str = "") -> str:
+    @traceable(name="Detect Layout (Scout)", run_type="tool")
+    @async_retry_with_backoff(retries=2)
+    async def detect_layout(self, image_data: bytes) -> List[Dict[str, Any]]:
         """
-        Fully async entry point. 
-        Accepts bytes (Stateless) instead of file paths.
+        Pass 1: Returns fuzzy bounding boxes (0-1000 normalized).
+        Uses lower resolution (1000px) and no enhancement for speed.
+        """
+        if not image_data: return []
+        
+        loop = asyncio.get_running_loop()
+        try:
+            # Fast processing for Router (1000px, No Enhance)
+            b64_img = await loop.run_in_executor(
+                _IMG_EXECUTOR, self._process_image_bytes, image_data, 1000, False
+            )
+        except Exception:
+            return []
+
+        messages = [
+            SystemMessage(content=PROMPT_SCOUT),
+            HumanMessage(content=[{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}])
+        ]
+        
+        # Expecting JSON output
+        resp = await self.router.ainvoke(messages)
+        try:
+            data = json.loads(resp.content)
+            # FIX: Handle case where 'regions' is None or data is not a dict
+            regions = data.get("regions", []) if isinstance(data, dict) else []
+            return regions if regions is not None else []
+        except Exception:
+            return []
+
+    @traceable(name="Vision Analysis (Analyst)", run_type="tool")
+    @async_retry_with_backoff(retries=3)
+    async def analyze(self, image_data: bytes, mode: str = "chart", context: str = "") -> str:
+        """
+        Pass 2: Returns final forensic narrative.
+        Uses high resolution (3000px) and enhancement for precision.
         """
         if not image_data: return "[Error: No image data provided]"
 
-        # 1. Offload CPU work to ThreadPool
         loop = asyncio.get_running_loop()
         try:
-            base64_image = await loop.run_in_executor(
-                _IMG_EXECUTOR, self._process_image_bytes, image_data
+            # High-fidelity processing for Analyst (3000px, Enhanced)
+            b64_img = await loop.run_in_executor(
+                _IMG_EXECUTOR, self._process_image_bytes, image_data, 3000, True
             )
         except Exception as e:
             return f"[Error encoding image: {e}]"
 
-        # 2. Select Persona
+        # Select Persona
         system_prompt = PROMPT_FORENSIC_ANALYST if mode == "chart" else PROMPT_STRATEGIC_CONSULTANT
         temp = 0.0 if mode == "chart" else 0.2
 
-        # 2. Build Contextual Prompt
         messages = [
             SystemMessage(content=system_prompt),
-            HumanMessage(
-                content=[
-                    {"type": "text", "text": f"Context:\n{context}\n\nAnalyze:"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                ]
-            )
+            HumanMessage(content=[
+                {"type": "text", "text": f"GROUND TRUTH CONTEXT (Extracted via Code Probe):\n{context}\n\nAnalyze this visual:"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+            ])
         ]
-
-        # 3. Async Network Call
-        response = await self.vlm.ainvoke(messages, config={"temperature": temp})
+        
+        response = await self.analyst.ainvoke(messages, config={"temperature": temp})
         return response.content
 
 vision_tool = VisionTool()
