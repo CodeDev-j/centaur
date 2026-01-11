@@ -4,8 +4,9 @@ import logging
 import asyncio
 import random
 from functools import wraps
+from typing import List, Literal, Optional, Any
+from pydantic import BaseModel, Field
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 # Third-party
 from PIL import Image, ImageEnhance
@@ -18,9 +19,11 @@ from src.config import SystemConfig
 
 logger = logging.getLogger(__name__)
 
-# Dedicated thread pool for CPU-bound image operations to avoid blocking the Event Loop
 _IMG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
+# ==============================================================================
+# 🛡️ UTILS & SCHEMA
+# ==============================================================================
 def async_retry_with_backoff(retries=3, backoff_in_seconds=1):
     def decorator(func):
         @wraps(func)
@@ -32,115 +35,98 @@ def async_retry_with_backoff(retries=3, backoff_in_seconds=1):
                 except Exception as e:
                     if x == retries:
                         logger.error(f"Failed after {retries} retries: {e}")
-                        return f"[Error: Vision Analysis Failed - {str(e)}]"
-                    
-                    # [FIX] Non-blocking sleep allows other tasks to run during backoff
+                        return None
                     sleep_time = (backoff_in_seconds * 2 ** x) + random.uniform(0, 1)
-                    logger.warning(f"Vision Error: {e}. Retrying in {sleep_time:.2f}s...")
                     await asyncio.sleep(sleep_time)
                     x += 1
         return wrapper
     return decorator
 
 # ==============================================================================
-# 🧠 SYSTEM PROMPTS (THE "HYBRID" MODEL)
+# 📝 OUTPUT SCHEMA
 # ==============================================================================
+class BoundingBox(BaseModel):
+    # Normalized 0-1000 coordinates [ymin, xmin, ymax, xmax]
+    box_2d: List[int] = Field(..., min_items=4, max_items=4, description="[ymin, xmin, ymax, xmax]")
 
-PROMPT_FORENSIC_ANALYST = """
+class FinancialFact(BaseModel):
+    label: str = Field(..., description="The definitive Axis Label or Legend Key. IGNORE floating descriptions.")
+    value: str = Field(..., description="The numeric value or structural target.")
+    unit: str = Field(..., description="Inferred unit (e.g. 'EUR Million') or 'N/A'.")
+    
+    category: Literal[
+        "Metric",       # Hard Numbers found in charts/tables
+        "Risk",         # Explicit headwinds (negative financial impact)
+        "Strategy",     # Qualitative Pillars ONLY (No numbers)
+        "Structure",    # Concept Maps / Arrows (Source -> Target)
+        "Entity",       # Company Name
+        "Time"          # Period / Fiscal Year
+    ]
+    
+    # CRITICAL: Chain-of-Thought Enforcement
+    reasoning: str = Field(..., description="Audit: Must cite OCR 'Col' IDs and [ANCHOR] tags (e.g. 'Value in Col 10 aligns with [ANCHOR] label in Col 10').")
+    grounding: BoundingBox = Field(..., description="Visual citation for this fact")
+
+class ChartAnalysis(BaseModel):
+    title: str = Field(..., description="The chart or slide title")
+    summary: str = Field(..., description="Forensic narrative of the trends and logic trace")
+    
+    # Confidence Score for Logic Gating
+    confidence_score: float = Field(..., description="Self-evaluation (0.0-1.0). <0.7 implies ambiguity or blurriness.")
+    
+    # THE AUDIT LOG (Force "System 2" Thinking)
+    audit_log: List[str] = Field(..., description="List of visual traps detected and how they were resolved.")
+    
+    facts: List[FinancialFact] = Field(..., description="List of extracted facts with audit reasoning")
+
+# ==============================================================================
+# 🧠 THE HYBRID SYSTEM PROMPT
+# ==============================================================================
+PROMPT_FINANCIAL_FORENSIC = """
 ## ROLE
-You are an expert Credit Underwriter and Forensic Data Analyst. Your task is to extract quantitative data from financial visualizations (Charts, Waterfalls, Heatmaps) with 100% precision.
+You are an Adversarial Forensic Auditor. Your goal is to extract "Ground Truth" data while actively resisting visual "Traps" (misalignment, ambiguity) in financial slides.
 
 ## INPUT DATA
-You are provided with:
-1. **The Chart Image:** The visual ground truth.
-2. **Detected Legend Bindings:** High-confidence text-to-color bindings detected by a geometric code probe (e.g., "'Revenue' == #ff0000").
-3. **Internal Grid Layout:** Raw text detected inside the chart structure.
-4. **Content Signals:** Keywords found in the text (e.g., "Bridge", "Forecast") that suggest the chart type.
+1. **Visual Evidence:** High-res image (Primary Source).
+2. **Spatial Map (OCR):** Text grid tagged with `[ANCHOR]` (Structural Base) and `[FLOATER]` (Context).
+3. **Regional Layout Guidelines:** Specific spatial boundaries for each chart.
 
-## OBJECTIVE
-Convert the visual data into a **Dense, Factual Narrative** optimized for RAG retrieval.
+## PROTOCOL 1: DATA INTEGRITY (The Basics)
+- **Visual Supremacy:** If Image shows "$50.4M" but OCR says "$SO. 4 M", trust the Image.
+- **Glyph Correction:** Fix common OCR errors ('S'->'5', 'O'->'0', 'I'->'1').
+- **Time Normalization:** Expand dates (e.g., "'24" -> "2024").
 
-## ANALYSIS PROTOCOL (STRICT EXECUTION ORDER)
+## PROTOCOL 2: RAG OPTIMIZATION (Context)
+- **De-referencing:** NEVER return generic labels like "Revenue". You MUST prefix every label with the Entity Name and Time Period (e.g., "Alphabet Q1 2025 Revenue").
+- **Standalone Facts:** Assume the user will see *only* the extracted fact in isolation.
 
-1. **Metadata & Period Classification (The Financial Layer):**
-   - **Time Normalization:** Detect and expand abbreviated dates (e.g., "'24" -> "2024", "LTM" -> "Last Twelve Months").
-   - **Historical vs. Projected:** - **Default Assumption:** Treat all data as **Actual/Historical** unless explicitly indicated otherwise.
-     - **Exception Triggers:** Mark data as "Projected" or "Forecast" ONLY if you see:
-       - Explicit Suffixes: 'E' (2025E), 'P' (2025P), 'F' (Forecast), 'B' (Budget).
-       - Explicit Titles: "Outlook", "Guidance", "Projections".
-       - Visual Cues: Dashed borders, lighter shading, or "break lines" separating history from future.
-       - **Future Dates:** Years more than 12 months in the future (accommodates fiscal year-ends).
-   - **Unit Inference:** If units ($, %, Millions) are not in the title, infer them from axis labels.
+## PROTOCOL 3: THE SEMANTIC ANCHOR PROTOCOL (Vertical Logic)
+You will receive text tagged as `[ANCHOR]` or `[FLOATER]`.
+1. **The Anchor Rule:** In 95% of charts, the Category/Axis Label is the `[ANCHOR]` (lowest item in column).
+   - ALWAYS map the chart's primary categories to the `[ANCHOR]` text.
+2. **The Waterfall Trap Fix:** - IF the chart is a Waterfall, text tagged as `[FLOATER]` is usually a 'Driver' (e.g., "Cost Savings").
+   - RULE: Ignore `[FLOATER]` text when determining the Category Name. Use the `[ANCHOR]` (e.g. "EBIT").
+3. **Stacked Bars:** - Text tagged as `[FLOATER]` represents internal Segments. Capture as nested data, but keep `[ANCHOR]` as the period.
 
-2. **Binding Logic (The Physics Layer):**
-   - **Detected Legend Bindings (PRIMARY):** Check the "DETECTED LEGEND BINDINGS (High Confidence)" list provided in the input. 
-     - *Example:* If it lists "'Revenue' == #ff0000", look for Red bars to assign to Revenue.
-   - **Color Intersection (SECONDARY):** If no verified legend is provided, look at the pixel color *directly underneath* the number. 
-   - **Leader Lines:** Trace lines connecting small floating numbers or categories to thin segments.
-   - **Legend Order (TIE-BREAKER):** The visual stack order often matches the legend, BUT inversions are common (e.g., Legend is Top-Down, Stack is Bottom-Up). Use this only if color/proximity is ambiguous.
+## PROTOCOL 4: THE COLUMN LOCK (Horizontal Logic)
+- **Reference:** Look at **[VIEW 2: VERTICAL SCANNING]**.
+- **Rule:** A Value and its Axis Label **MUST share the same 'Col' index**.
+- **Violation:** If Value is in "Col 16" and Label is in "Col 10", they are **NOT** related.
 
-3. **Chart-Specific Rules (The Architecture Layer):**
-   - **STACKED BARS (The "Roof" Rule):** - Numbers *inside* colored blocks are **Constituents**.
-     - Numbers *floating above* the bar are **Totals**.
-     - **CRITICAL:** Do NOT list the "Total" as a component of itself.
-     - **Summation Audit:** Sum the extracted segments.
-       - If (A + B) < Total: There is a missing/unlabeled segment. Label the gap as "Other/Unlabeled".
-       - If (A + B) > Total: You likely double-counted a Total label as a Segment. Re-evaluate.
-   - **WATERFALL CHARTS:** - **Check Content Signals:** If input mentions "Waterfall" or "Bridge", apply Bridge Logic (Start + Deltas = End).
-     - Distinguish between "Movement Bars" (floating) and "Subtotal Bars" (grounded).
-   - **DUAL AXIS CHARTS:** - Distinguish between Left-Axis metrics (usually Bars, e.g., Revenue) and Right-Axis metrics (usually Lines, e.g., Margin %).
-   - **COMPOUND LAYOUTS:** - If an image contains multiple distinct charts (e.g., Side-by-Side), treat them as separate entities.
-     - Explicitly label them in the narrative (e.g., "Left Chart: Revenues...", "Right Chart: Operating Income...").
+## PROTOCOL 5: REMAINING VISUAL TRAPS
+1. **The Roof Rule (Stacked Bars):**
+   - *Risk:* Double counting totals.
+   - *Rule:* Floating numbers are **Totals**. Internal numbers are **Constituents**. Extract them separately.
+2. **The Category Trap:**
+   - *Risk:* Confusing strategic goals with hard metrics.
+   - *Rule:* If it's a number, it's a **Metric**. "Strategy" is strictly for qualitative text (no numbers).
+3. **Coordinate Validation:** - Check the Y-coordinates provided in the brackets.
+   - If a text block is at Y=600 and the Anchor is at Y=900, they are physically distant. Do not merge them unless they are part of a multi-line label.
 
-4. **Validation (Math & Magnitude):**
-   - **Magnitude Check:** Does the largest visual block correspond to the largest extracted number? If a small bar has a huge number, re-read the units or axis.
-
-## OUTPUT FORMAT
-Provide a single text block. Do NOT use Markdown tables.
-**[METADATA]:** {Title} | {Time Period Range} | {Units}
-**[LOGIC TRACE]:** Briefly explain why you marked periods as Actual/Projected and which legend key you mapped to specific colors.
-**[NARRATIVE]:**
-* **Trend Overview:** A concise sentence summarizing the direction (e.g. "Revenue grew 10% YoY, with 2025 projected to accelerate").
-* **Data Series:** Full sentences linking specific periods to values.
-    * *Structure:* "In [Period] ([Type: Actual/Projected]), [Metric Total] was [Total Value]. This consisted of [Value A] from [Segment A] and [Value B] from [Segment B]."
-* **Key Annotations:** Note explicit markers like "Projected", "Unaudited", "CAGR", or "Margins".
-
-## CONSTRAINTS
-* **NO ESTIMATION:** If a number is not labeled, write "Value not labeled." Do not guess based on bar height.
-* **PRECISION:** Do not simply describe colors ("The red bar"); translate them into their data labels ("The R&D Expense").
-"""
-
-PROMPT_STRATEGIC_CONSULTANT = """
-## ROLE
-You are a Senior Strategic Consultant performing Due Diligence for a Private Equity firm. Your task is to analyze structural diagrams (Org Charts, Process Flows, Tech Stacks) to identify value drivers, risks, and operational inefficiencies.
-
-## OBJECTIVE
-Translate 2D visual relationships into a **Structured Semantic Summary** that captures hierarchy, sequence, causality, and *implied* business logic.
-
-## ANALYSIS PROTOCOL (THE "STRATEGIC LENS")
-
-1. **Classify & Decode:**
-   - **Org Charts:** Identify the "Power Structure." Who reports to whom? Is the structure Functional, Divisional, or Matrix?
-     - *Risk Check:* Look for high "Span of Control" (one manager with too many reports) or undefined reporting lines.
-   - **Process Flows:** Trace the critical path (Input -> Transformation -> Output).
-     - *Risk Check:* Identify bottlenecks, circular dependencies, or single points of failure.
-   - **Architecture/Tech Stacks:** Identify key platforms and integration points.
-
-2. **Semantic Extraction:**
-   - Convert visual cues into business meaning:
-     - *Dotted Lines:* "Indirect/Matrix reporting" or "Advisory relationship".
-     - *Double-headed Arrows:* "Two-way data exchange" or "Mutual dependency".
-     - *Color Coding:* Often implies department grouping or status (e.g., Red = At Risk).
-
-## OUTPUT FORMAT
-**[TYPE]:** {e.g., Functional Org Chart, Supply Chain Map, IT Network Diagram}
-**[TITLE]:** {Title}
-**[STRUCTURED SUMMARY]:**
-* **Strategic Takeaway:** One high-impact sentence on what this visual implies for the investment thesis (e.g., "The organization is heavily siloed by geography, potentially hindering global product rollouts").
-* **Key Observations:**
-    * **Hierarchy/Flow:** [Briefly describe the top-level structure or main sequence].
-    * **Critical Nodes:** [Identify the most connected or central elements].
-    * **Risks/Inefficiencies:** [Explicitly call out structural weaknesses found in step 1].
+## OUTPUT REQUIREMENTS
+1.  **Audit Log:** Cite specific columns and tags (e.g., "Mapped Value in Col 10 to [ANCHOR] 'EBIT' in Col 10").
+2.  **Reasoning:** Explain alignment using Anchor/Floater logic.
+3.  **Confidence:** Rate your certainty.
 """
 
 # ==============================================================================
@@ -148,47 +134,37 @@ Translate 2D visual relationships into a **Structured Semantic Summary** that ca
 # ==============================================================================
 class VisionTool:
     def __init__(self):
-        # Use LangChain wrapper for better tracing in LangSmith
-        self.vlm = ChatOpenAI(
-            model=SystemConfig.VISION_MODEL,
+        # Using getattr to safely fetch model config
+        self.llm = ChatOpenAI(
+            model=SystemConfig.VISION_MODEL, 
             temperature=0.0,
-            max_tokens=1024,
-            # Ensure timeout to prevent hanging connections
+            max_tokens=4000,
             request_timeout=60
-        )
-        logger.info(f"👁️ Vision Tool initialized with model: {SystemConfig.VISION_MODEL}")
+        ).with_structured_output(ChartAnalysis)
 
-    def _process_image_bytes(self, img_bytes: bytes, max_dim: int = 2000) -> str:
-        """
-        CPU-bound processing: Resize, Enhance, and Encode to JPEG.
-        Executed in a thread pool to avoid blocking the async event loop.
-        """
+        logger.info(f"👁️ Vision Tool initialized. Model: {getattr(SystemConfig, 'VISION_MODEL', 'gpt-4o')} | Mode: Hybrid Forensic")
+
+    def _process_image_bytes(self, img_bytes: bytes, max_dim: int = 3000) -> str:
         try:
             with Image.open(io.BytesIO(img_bytes)) as img:
-                # 1. Handle Transparency (Safety for RGBA -> JPEG)
+                # 1. Handle Transparency
                 if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
                     bg = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode != 'RGBA':
-                        img = img.convert('RGBA')
+                    if img.mode != 'RGBA': img = img.convert('RGBA')
                     bg.paste(img, mask=img.split()[3])
                     img = bg
                 else:
                     img = img.convert('RGB')
 
-                # 2. Boost Contrast (Helps separate light bars/gridlines from white background)
-                # Factor 1.4 = +40% Contrast
+                # 2. Boost Contrast (Helps separate light bars from white background)
                 enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(1.4) 
+                img = enhancer.enhance(1.4)
                 
-                # 3. Boost Sharpness (Helps OCR read small axis labels)
-                # Factor 1.5 = +50% Sharpness
+                # 3. Boost Sharpness (Helps read small axis labels)
                 enhancer = ImageEnhance.Sharpness(img)
                 img = enhancer.enhance(1.5)
-                # ---------------------------------
 
-                # Standard Resize Logic
-                # [FIX] INCREASED MAX_DIM TO 3000
-                # Previous 1500 limit was shrinking the 3x scaled images, causing fuzziness.
+                # 4. Resize if too large
                 width, height = img.size
                 if max(width, height) > max_dim:
                     ratio = max_dim / max(width, height)
@@ -202,41 +178,97 @@ class VisionTool:
             logger.error(f"Image processing failed: {e}")
             raise
 
-    @traceable(name="Vision Analysis", run_type="tool")
+    @traceable(name="Analyze Page (Full)", run_type="tool")
     @async_retry_with_backoff(retries=3)
-    async def analyze(self, image_data: bytes, mode: str = "general", context: str = "") -> str:
-        """
-        Fully async entry point. 
-        Accepts bytes (Stateless) instead of file paths.
-        """
-        if not image_data: return "[Error: No image data provided]"
+    # Note: layout_hint type is 'Any' or 'PageLayout' from layout_scanner.py
+    async def analyze_full_page(self, image_data: bytes, ocr_context: str, layout_hint: Any = None) -> Optional[ChartAnalysis]:
+        if not image_data: return None
 
-        # 1. Offload CPU work to ThreadPool
         loop = asyncio.get_running_loop()
         try:
-            base64_image = await loop.run_in_executor(
-                _IMG_EXECUTOR, self._process_image_bytes, image_data
+            # High-fidelity processing (3000px)
+            b64_img = await loop.run_in_executor(
+                _IMG_EXECUTOR, self._process_image_bytes, image_data, 3000
             )
         except Exception as e:
-            return f"[Error encoding image: {e}]"
+            logger.error(f"Image encoding failed: {e}")
+            return None
 
-        # 2. Select Persona
-        system_prompt = PROMPT_FORENSIC_ANALYST if mode == "chart" else PROMPT_STRATEGIC_CONSULTANT
-        temp = 0.0 if mode == "chart" else 0.2
+        # --- DYNAMIC PROMPT CONSTRUCTION ---
+        region_instructions = "## DYNAMIC REGIONAL GUIDELINES (Virtual ROI)\n"
+        
+        if layout_hint and getattr(layout_hint, 'has_charts', False):
+            for chart in layout_hint.charts:
+                ymin, xmin, ymax, xmax = chart.bbox
+                height = ymax - ymin
+                width = xmax - xmin
+                
+                # Content Hints from Scout (The Fix)
+                labels_hint = getattr(chart, 'axis_labels', [])
+                values_hint = getattr(chart, 'data_values', [])
+                content_hint_str = ""
+                if labels_hint or values_hint:
+                    content_hint_str = f"- **Content Hints:** Look for Axis Labels: {labels_hint[:10]}... and Values: {values_hint[:10]}..."
 
-        # 2. Build Contextual Prompt
+                # Check for explicit baseline from Scout
+                baseline = getattr(chart, 'axis_baseline_y', None)
+                
+                orientation = getattr(chart, "axis_orientation", "Bottom")
+                search_zone_desc = f"Within BBox {chart.bbox}"
+                context_rule = "Use Anchor tags."
+
+                if orientation == "Bottom":
+                    if baseline:
+                        # Ultra-precise zone around baseline (+/- 10%)
+                        # This tells the VLM *exactly* where the Anchor line is.
+                        axis_min = int(baseline - (height * 0.10))
+                        axis_max = int(baseline + (height * 0.10))
+                        search_zone_desc = f"Y-Range [{axis_min} to {axis_max}] (around Baseline Y={baseline})"
+                    else:
+                        # Fallback to Bottom 25% only if baseline is missing
+                        axis_min = int(ymax - (height * 0.25))
+                        search_zone_desc = f"Y-Range [{axis_min} to {ymax}] (Bottom 25%)"
+                    
+                    context_rule = f"Text above Y={axis_min} is likely [FLOATER] Context."
+                    
+                elif orientation == "Left":
+                    # Horizontal Bar Logic
+                    axis_max_x = int(xmin + (width * 0.30))
+                    search_zone_desc = f"X-Range [{xmin} to {axis_max_x}] (Left 30%)"
+                    context_rule = f"Text to the right of X={axis_max_x} is Context."
+
+                region_instructions += f"""
+                ### REGION {chart.region_id} ({chart.chart_type})
+                - **Boundaries:** {chart.bbox}
+                - **Orientation:** {orientation}
+                - **Axis Zone:** {search_zone_desc}
+                - **Horizontal Bleed Guard:** Do NOT map labels found significantly outside the X-range [{xmin}-{xmax}].
+                {content_hint_str}
+                - **Instruction:** {context_rule}
+                """
+        else:
+            region_instructions += "No charts detected. Treat page as standard text/table layout."
+
+        # Combine the Forensic Prompt with the Dynamic Regional Rules
         messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(
-                content=[
-                    {"type": "text", "text": f"Context:\n{context}\n\nAnalyze:"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                ]
-            )
+            SystemMessage(content=PROMPT_FINANCIAL_FORENSIC + "\n\n" + region_instructions),
+            HumanMessage(content=[
+                {"type": "text", "text": f"[OCR SPATIAL MAP]\n{ocr_context}"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+            ])
         ]
-
-        # 3. Async Network Call
-        response = await self.vlm.ainvoke(messages, config={"temperature": temp})
-        return response.content
+        
+        try:
+            # Returns a Pydantic object directly
+            result = await self.llm.ainvoke(messages)
+            
+            # Log the confidence score for debugging
+            if result:
+                logger.info(f"🔎 VLM Extraction Complete. Confidence: {result.confidence_score:.2f} | Facts: {len(result.facts)}")
+                
+            return result
+        except Exception as e:
+            logger.error(f"Vision Analysis Failed: {e}")
+            return None
 
 vision_tool = VisionTool()

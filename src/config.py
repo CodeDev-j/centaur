@@ -13,9 +13,11 @@ class SystemConfig:
     DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "OPENAI_DEV")
     
     # Model Selection
+    # Wired up to .env so you can toggle costs easily
+    LAYOUT_MODEL = os.getenv("LAYOUT_MODEL_NAME", "gpt-4o-mini") 
     VISION_MODEL = os.getenv("VISION_MODEL_NAME", "gpt-4o")
     REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4o")
-    EMBEDDING_MODEL = "fastembed" # Keeping your explicit definition
+    EMBEDDING_MODEL = "fastembed" 
     
     # Infrastructure (REQUIRED for Docker connection)
     POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")

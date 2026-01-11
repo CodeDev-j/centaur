@@ -1,7 +1,8 @@
 import json
-import aiofiles
-from typing import Dict, Any
 import logging
+import aiofiles
+from pathlib import Path
+from typing import Dict, Any
 from langsmith import traceable
 
 from src.config import SystemPaths
@@ -11,8 +12,7 @@ logger = logging.getLogger(__name__)
 class BlobDriver:
     """
     Abstraction layer for 'Content Truth' storage.
-    Currently maps to local file system (data/blobs).
-    Future: Will map to Azure Blob Storage SDK.
+    Maps to local file system (data/blobs).
     """
 
     @staticmethod
@@ -22,19 +22,22 @@ class BlobDriver:
         Saves a JSON artifact.
         
         Allowed Folders:
-        - layouts: Coordinate maps of documents (PDFParser).
-        - tables: Structured HTML/JSON of complex tables (PDFParser).
-        - definitions: Extracted legal terms (TermInjector).
+        - layouts: Coordinate maps of documents.
+        - tables: Structured HTML/JSON of complex tables.
+        - definitions: Extracted legal terms.
         """
         # Determine strict path based on folder type
         if folder == "layouts":
             base_dir = SystemPaths.LAYOUTS
         elif folder == "definitions":
             base_dir = SystemPaths.DEFINITIONS
-        elif folder == "tables":  # <--- CRITICAL FIX
+        elif folder == "tables":
             base_dir = SystemPaths.TABLES
         else:
             raise ValueError(f"Invalid blob folder: {folder}")
+
+        # Ensure directory exists
+        base_dir.mkdir(parents=True, exist_ok=True)
 
         target_path = base_dir / filename
         
@@ -59,6 +62,7 @@ class BlobDriver:
         else:
             raise ValueError(f"Invalid blob folder: {folder}")
 
+        base_dir.mkdir(parents=True, exist_ok=True)
         target_path = base_dir / filename
         
         try:
@@ -72,13 +76,41 @@ class BlobDriver:
             raise
 
     @staticmethod
+    @traceable(name="Save Image Blob", run_type="tool")
+    async def save_image(img_data: bytes, folder: str, filename: str) -> str:
+        """
+        Saves a binary image artifact (PNG/JPG) for Audit Trails.
+        New in Centaur 2.0.
+        """
+        # We store full page visual layouts here
+        if folder == "layouts":
+            base_dir = SystemPaths.LAYOUTS
+        else:
+            raise ValueError(f"Invalid blob folder for images: {folder}")
+
+        # Ensure directory exists
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        target_path = base_dir / filename
+        
+        try:
+            # Use 'wb' for write binary
+            async with aiofiles.open(target_path, mode='wb') as f:
+                await f.write(img_data)
+            
+            logger.info(f"Saved image artifact: {folder}/{filename}")
+            return f"{folder}/{filename}"
+        except Exception as e:
+            logger.error(f"Failed to save Image blob {filename}: {e}")
+            raise
+
+    @staticmethod
     @traceable(name="Load JSON Blob", run_type="tool")
     def load_json(blob_path: str) -> Dict[str, Any]:
         """
         Retrieves a JSON artifact.
         blob_path format: "layouts/chunk_123.json"
         """
-        # Construct full local path
         full_path = SystemPaths.ARTIFACTS / blob_path
         
         if not full_path.exists():
