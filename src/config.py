@@ -14,9 +14,9 @@ class SystemConfig:
     
     # Model Selection
     # Wired up to .env so you can toggle costs easily
-    LAYOUT_MODEL = os.getenv("LAYOUT_MODEL_NAME", "gpt-4o-mini") 
-    VISION_MODEL = os.getenv("VISION_MODEL_NAME", "gpt-4o")
-    REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4o")
+    LAYOUT_MODEL = os.getenv("LAYOUT_MODEL_NAME", "gpt-4.1-mini") 
+    VISION_MODEL = os.getenv("VISION_MODEL_NAME", "gpt-4.1")
+    REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4.1")
     EMBEDDING_MODEL = "fastembed" 
     
     # Infrastructure (REQUIRED for Docker connection)
