@@ -3,33 +3,31 @@ import hashlib
 import math
 import collections
 import re
-import statistics
-import string
 import asyncio
 import io
+import base64
 import colorsys
 import numpy as np
 from uuid import uuid4
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Set, Tuple
+from typing import List, Optional, Tuple, Dict, Any, Set
 from concurrent.futures import ThreadPoolExecutor
 
 # Third-party
 import fitz  # PyMuPDF
-import pandas as pd
 from PIL import Image
+from rapidocr_onnxruntime import RapidOCR
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.datamodel.document import DocItem, TableItem, PictureItem
-from rapidocr_onnxruntime import RapidOCR
+from docling.datamodel.document import TableItem
 from langsmith import traceable
 
 # Internal
 from src.schemas.documents import IngestedChunk
-from src.schemas.citation import BoundingBox
 from src.storage.blob_driver import BlobDriver
 from src.tools.vision import vision_tool
+from src.tools.layout_scanner import layout_scanner
 from src.config import SystemPaths
 
 logger = logging.getLogger(__name__)
@@ -73,17 +71,22 @@ class ColorResolver:
         return "Pink"
 
     @classmethod
-    def resolve_names(cls, bindings: List[Tuple[str, Tuple[int, int, int], str]]) -> List[str]:
+    def resolve_names(cls, bindings: List[Dict[str, Any]]) -> List[str]:
         """
-        Input: List of (Label, RGB_Tuple, Hex_String)
+        Handles dictionary inputs with 'confirmed' flag.
+        Input: List of {'text': str, 'rgb': tuple, 'hex': str, 'confirmed': bool}
         Output: List of strings "Legend Key: 'Label' == Hex (Semantic Name)"
         """
         # 1. Group by Base Hue
         groups = collections.defaultdict(list)
-        for label, rgb, hex_c in bindings:
-            base = cls.get_base_hue(rgb)
+        for item in bindings:
+            base = cls.get_base_hue(item['rgb'])
             groups[base].append({
-                "label": label, "rgb": rgb, "hex": hex_c, "lum": cls.get_luminance(rgb)
+                "label": item['text'], 
+                "rgb": item['rgb'], 
+                "hex": item['hex'], 
+                "lum": cls.get_luminance(item['rgb']),
+                "confirmed": item['confirmed']
             })
 
         results = []
@@ -93,7 +96,8 @@ class ColorResolver:
             if len(items) == 1:
                 # No collision: Just use the Base Name
                 i = items[0]
-                results.append(f"Legend Key: '{i['label']}' == {i['hex']} ({base_name})")
+                prefix = "[CONFIRMED LEGEND]" if i['confirmed'] else "[POSSIBLE LEGEND]"
+                results.append(f"{prefix} '{i['label']}' == {i['hex']} ({base_name})")
             else:
                 # Collision: Sort by Luminance (Darkest to Lightest)
                 items.sort(key=lambda x: x["lum"])
@@ -112,7 +116,8 @@ class ColorResolver:
                         intensity = int((idx / (count - 1)) * 100)
                         mod = f"Luminance-{intensity}"
                     
-                    results.append(f"Legend Key: '{item['label']}' == {item['hex']} ({mod} {base_name})")
+                    prefix = "[CONFIRMED LEGEND]" if item['confirmed'] else "[POSSIBLE LEGEND]"
+                    results.append(f"{prefix} '{item['label']}' == {item['hex']} ({mod} {base_name})")
 
         return results
 
@@ -152,148 +157,127 @@ class SpatialIndex:
         return results
 
 # ==============================================================================
-# 🧠 INTELLIGENT CLASSIFIER (OPTIMIZED)
-# ==============================================================================
-@traceable(name="Classify Region", run_type="chain")
-def classify_region(text_items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not text_items:
-        return {"decision": "chart", "score": 0.0, "evidence": {}, "features": {}}
-
-    full_text = " ".join([t.get('text', '') for t in text_items])
-    tokens = full_text.split()
-    total_tokens = len(tokens) if tokens else 1
-    
-    # --- VARIABLE 1: Alpha-Token Ratio ---
-    clean_tokens = [t.strip(string.punctuation) for t in tokens]
-    alpha_count = sum(1 for t in clean_tokens if t.isalpha() and len(t) > 1)
-    v1_structure_signal = 1.0 - (alpha_count / total_tokens)
-
-    # --- VARIABLE 2: Universal Entity Density ---
-    score_v2_raw = 0.0
-    currency_pattern = r'[$€£¥]|\b(USD|EUR|GBP|JPY|CHF|CAD|AUD|CNY|HKD|SGD|NZD|KRW)\b|\(\d{1,3}(?:,\d{3})*\)|\d+(?:\.\d+)?[x%]'
-    score_v2_raw += len(re.findall(currency_pattern, full_text, re.IGNORECASE)) * 2.0
-    safe_asset_regex = r'\b(sq\s?ft|sf|m2|psf|keys|MW|GWh|TEU|dwt|mt|bbl)\b|\b(?=.*\d)(?=.*[A-Z])[A-Z0-9]{9,12}\b'
-    score_v2_raw += len(re.findall(safe_asset_regex, full_text, re.IGNORECASE)) * 3.0
-    score_v2_raw += len(re.findall(r'\b(?:FY|Q[1-4]|LTM)\d{2}\b|\b2[0O]\d{2}[E]?\b', full_text)) * 1.5
-    v2_data_density = min(score_v2_raw / total_tokens, 1.0)
-
-    # --- VARIABLE 3: Geometric Alignment ---
-    x_starts = sorted([t.get('bbox', [0])[0] for t in text_items])
-    v3_grid_score = 0.0
-    
-    if len(x_starts) > 5:
-        clusters = []
-        if x_starts:
-            current = [x_starts[0]]
-            region_width = x_starts[-1] - x_starts[0]
-            jitter_tol = max(15, region_width * 0.02)
-            
-            for x in x_starts[1:]:
-                if x - current[-1] < jitter_tol:
-                    current.append(x)
-                else:
-                    clusters.append(current)
-                    current = [x]
-            clusters.append(current)
-        
-        valid_cols = [c for c in clusters if len(c) > len(x_starts) * 0.10]
-        num_peaks = len(valid_cols)
-        
-        if num_peaks >= 3:
-            v3_grid_score = 1.0
-        elif num_peaks == 2:
-            mid_x = (x_starts[0] + x_starts[-1]) / 2
-            right_col_text = " ".join([t.get('text', '') for t in text_items if t.get('bbox', [0])[0] > mid_x])
-            digit_ratio = sum(c.isdigit() for c in right_col_text) / (len(right_col_text) or 1)
-            right_tokens = right_col_text.split()
-            title_ratio = sum(1 for w in right_tokens if w.istitle() or w.isupper()) / (len(right_tokens) or 1)
-            if digit_ratio > 0.4 or title_ratio > 0.25: v3_grid_score = 0.85 
-            else: v3_grid_score = 0.20 
-
-    # --- VARIABLE 4: Guardrails ---
-    has_toc = len(re.findall(r'\.{5,}\s*\d+$', full_text, re.MULTILINE)) > 1
-    header_sample = full_text[:200].lower()
-    is_legal = re.search(r'^(article|section)\s+\d', header_sample)
-    is_note = "note" in header_sample 
-    legal_header = re.search(r'forward[- ]looking|risk factors|disclaimer', header_sample, re.IGNORECASE)
-    v4_penalty = 0.0
-    if has_toc: v4_penalty = 1.0 
-    elif (is_legal and not is_note) or legal_header: v4_penalty = 0.8 
-
-    final_score = ((0.35 * v1_structure_signal) + (0.30 * v3_grid_score) + (0.35 * v2_data_density)) * (1.0 - v4_penalty)
-    is_financial_structure = final_score > 0.50
-    
-    return {
-        "decision": "chart" if is_financial_structure else "general",
-        "score": round(final_score, 3),
-        "evidence": {
-            "layout_structure": "Grid" if v3_grid_score == 1.0 else ("KV" if v3_grid_score == 0.85 else "Freeform"),
-            "risk_flag": "TOC/Legal" if v4_penalty > 0.5 else "None"
-        }
-    }
-
-# ==============================================================================
 # 📄 PDF PARSER
 # ==============================================================================
 class PDFParser:
     def __init__(self):
+        # 1. OCR Engine
+        self.ocr_engine = RapidOCR()
+        
+        # 2. Docling Setup (Kept ONLY for Tables)
         pipeline_opts = PdfPipelineOptions()
-        pipeline_opts.do_ocr = True
+        pipeline_opts.do_ocr = True 
         pipeline_opts.do_table_structure = True
-        pipeline_opts.generate_page_images = True
-        pipeline_opts.generate_picture_images = True
         pipeline_opts.images_scale = 3.0 
         
         self.converter = DocumentConverter(
             format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_opts)}
         )
-        self.ocr_engine = RapidOCR()
-        self.suppressed_items: Set[int] = set()
 
-    @traceable(name="Parse PDF File", run_type="parser")
-    async def parse(self, file_path: Path) -> List[IngestedChunk]:
-        if not file_path.exists(): raise FileNotFoundError(f"File not found: {file_path}")
-        logger.info(f"🎨 Starting Centaur ingestion for: {file_path.name}")
-        
-        # [BLOCKING FIX] Offload Docling to Thread
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, self.converter.convert, file_path)
-        
-        doc = result.document
-        doc_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
-        chunks: List[IngestedChunk] = []
-        self.suppressed_items = set()
+    # --- VECTOR MATH HELPERS (Preserved) ---
+    def _is_valid_color(self, p: tuple) -> bool:
+        r, g, b = p[0], p[1], p[2]
+        if r > 240 and g > 240 and b > 240: return False # White
+        if r < 20 and g < 20 and b < 20: return False    # Black
+        if abs(r-g) < 15 and abs(g-b) < 15: return False # Gray
+        return True
 
-        # Open Fitz once, cheaply
-        with fitz.open(file_path) as pdf_doc:
-            # PASS 1: VISUALS
-            for item, _ in doc.iterate_items():
-                label_val = getattr(item.label, 'value', 'unknown') if hasattr(item, 'label') else 'unknown'
-                if label_val in ["page_header", "page_footer"]: continue
-                
-                if isinstance(item, TableItem):
-                    chunks.extend(await self._process_complex_table(item, doc, doc_hash, file_path.name))
-                    continue
-                    
-                if isinstance(item, PictureItem) or label_val in ["picture", "figure", "chart"]:
-                    vision_chunk = await self._process_visual(item, doc, pdf_doc, doc_hash, file_path.name)
-                    if vision_chunk: chunks.append(vision_chunk)
-                    continue
+    def _rect_distance(self, r1: fitz.Rect, r2: fitz.Rect) -> float:
+        x_dist = max(0, r1.x0 - r2.x1, r2.x0 - r1.x1)
+        y_dist = max(0, r1.y0 - r2.y1, r2.y0 - r1.y1)
+        return math.sqrt(x_dist**2 + y_dist**2)
 
-            # PASS 2: TEXT
-            for item, _ in doc.iterate_items():
-                label_val = getattr(item.label, 'value', 'unknown') if hasattr(item, 'label') else 'unknown'
-                if label_val in ["page_header", "page_footer"]: continue
-                if id(item) in self.suppressed_items: continue
-                if isinstance(item, (TableItem, PictureItem)): continue
-                if label_val in ["picture", "figure", "chart"]: continue
+    def _extract_text_spatial(self, img_np: np.ndarray) -> str:
+        """Runs OCR on the full page image to get the Spatial Grid."""
+        try:
+            result, _ = self.ocr_engine(img_np)
+            if not result: return ""
+            spatial_text = []
+            for res in result:
+                box, text, _ = res
+                x, y = int(box[0][0]), int(box[0][1])
+                spatial_text.append(f"[{y}, {x}] {text}")
+            return "\n".join(spatial_text)
+        except Exception as e:
+            logger.warning(f"OCR failed: {e}")
+            return ""
 
-                if hasattr(item, "text") and item.text.strip():
-                    chunk = self._create_standard_chunk(item, doc, doc_hash, file_path.name)
-                    if chunk: chunks.append(chunk)
+    def _generate_vector_hints(self, page: fitz.Page, layout: Optional[Any] = None) -> str:
+        """
+        THE GOLD MINE: Uses your preserved SpatialIndex logic to find
+        Legend matches on the WHOLE page and returns them as text hints.
+        """
+        try:
+            # 1. Extract Valid Legend Keys from Layout Scout (The Semantic Filter)
+            valid_keys = set()
+            if layout and layout.charts:
+                for chart in layout.charts:
+                    for key in chart.legend_keys:
+                        valid_keys.add(key.lower().strip())
 
-        logger.info(f"✅ Extracted {len(chunks)} chunks from {file_path.name}")
-        return chunks
+            # 2. Build Index of Vector Shapes (Preserved)
+            spatial_index = SpatialIndex(page.rect)
+            for d in page.get_drawings(): spatial_index.insert(d)
+            
+            # 2. Get Vector Text (Cleaner than OCR for finding legend labels)
+            text_blocks = page.get_text("dict")["blocks"]
+            raw_legend_bindings = []
+            
+            for block in text_blocks:
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span["text"].strip()
+                        if len(text) < 2 or any(c.isdigit() for c in text): continue 
+                        
+                        # [NEW] Semantic Check
+                        # If Layout Scout is available, check if text matches known keys
+                        is_confirmed = (text.lower() in valid_keys) if valid_keys else False
+                        
+                        # Search for color box (Preserved Logic)
+                        span_rect = fitz.Rect(span["bbox"])
+                        
+                        # Search area: Small buffer around the text (looking for the little color square)
+                        search_rect = span_rect + (-30, -5, 30, 5) 
+                        
+                        nearby_shapes = spatial_index.query(search_rect)
+                        candidates = []
+                        
+                        for shape in nearby_shapes:
+                            if shape.get('fill') is None: continue
+                            
+                            # Check valid color
+                            r, g, b = shape['fill']
+                            rgb_255 = (int(r*255), int(g*255), int(b*255))
+                            if not self._is_valid_color(rgb_255): continue
+                            
+                            s_rect = fitz.Rect(shape['rect'])
+                            dist = self._rect_distance(span_rect, s_rect)
+                            
+                            # Tight binding only (Legend markers are visually close)
+                            if dist < 25: 
+                                hex_c = '#{:02x}{:02x}{:02x}'.format(*rgb_255)
+                                candidates.append((dist, rgb_255, hex_c))
+                        
+                        if candidates:
+                            candidates.sort(key=lambda x: x[0]) # Closest shape wins
+                            best = candidates[0]
+                            # Store dictionary for updated ColorResolver
+                            raw_legend_bindings.append({
+                                "text": text, 
+                                "rgb": best[1], 
+                                "hex": best[2], 
+                                "confirmed": is_confirmed
+                            })
+
+            # 4. Resolve Shades (e.g. "Dark Red")
+            if not raw_legend_bindings: return ""
+            
+            hints = ColorResolver.resolve_names(raw_legend_bindings)
+            return "\n".join(hints)
+            
+        except Exception as e:
+            logger.warning(f"Vector hint generation failed: {e}")
+            return ""
 
     async def _process_complex_table(self, item, doc, doc_hash, filename) -> List[IngestedChunk]:
         df = item.export_to_dataframe(doc)
@@ -320,275 +304,113 @@ class PDFParser:
             ))
         return chunks
 
-    def _create_standard_chunk(self, item, doc, doc_hash, filename):
-        if not item.prov: return None
-        prov = item.prov[0]
-        page = doc.pages[prov.page_no]
-        width, height = page.size.width, page.size.height
-        l, r = sorted([prov.bbox.l, prov.bbox.r])
-        t, b = sorted([prov.bbox.t, prov.bbox.b])
+    @traceable(name="Parse PDF File", run_type="parser")
+    async def parse(self, file_path: Path) -> List[IngestedChunk]:
+        """
+        HYBRID PIPELINE:
+        1. Docling: Extracts complex Tables (The Gold)
+        2. VLM Loop: Extracts Visuals & Strategy (Single Pass Context)
+        """
+        if not file_path.exists(): raise FileNotFoundError(f"File not found: {file_path}")
+        logger.info(f"🎨 Starting Centaur ingestion for: {file_path.name}")
         
-        return IngestedChunk(
-            chunk_id=str(uuid4()), doc_hash=doc_hash, clean_text=item.text.strip(), raw_text=item.text,
-            page_number=prov.page_no, token_count=len(item.text.split()),
-            primary_bbox=BoundingBox(page_number=prov.page_no, x=l/width, y=t/height, width=(r-l)/width, height=(b-t)/height),
-            metadata={"source": filename, "type": "text"}
-        )
+        chunks = []
+        doc_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
 
-    # --- HELPERS ---
+        # --- STEP 1: DOCLING (Tables Only) ---
+        # Run Docling on a thread to avoid blocking
+        loop = asyncio.get_running_loop()
+        docling_res = await loop.run_in_executor(None, self.converter.convert, file_path)
+        doc = docling_res.document
 
-    def _get_safe_clip_rect(self, bbox, page_rect):
-        w, h = bbox.r - bbox.l, bbox.t - bbox.b
-        pad_w, pad_h = w * 0.1, h * 0.1
-        return fitz.Rect(
-            max(page_rect.x0, bbox.l - pad_w),
-            max(page_rect.y0, page_rect.height - bbox.t - pad_h),
-            min(page_rect.x1, bbox.r + pad_w),
-            min(page_rect.y1, page_rect.height - bbox.b + pad_h)
-        )
+        for item, _ in doc.iterate_items():
+            if isinstance(item, TableItem):
+                chunks.extend(await self._process_complex_table(item, doc, doc_hash, file_path.name))
 
-    def _rect_distance(self, r1: fitz.Rect, r2: fitz.Rect) -> float:
-        """Edge-to-Edge Euclidean Distance."""
-        x_dist = max(0, r1.x0 - r2.x1, r2.x0 - r1.x1)
-        y_dist = max(0, r1.y0 - r2.y1, r2.y0 - r1.y1)
-        return math.sqrt(x_dist**2 + y_dist**2)
-
-    def _is_text_visible(self, span: dict, page_bg=(1, 1, 1)) -> bool:
-        if span.get('alpha', 1) == 0: return False
-        if span.get('flags', 0) & 8: return False
-        # Allow white text (labels on bars)
-        return True
-
-    def _is_valid_color(self, p: tuple) -> bool:
-        """Strict Chromatic Check."""
-        r, g, b = p[0], p[1], p[2]
-        if r > 240 and g > 240 and b > 240: return False # White
-        if r < 20 and g < 20 and b < 20: return False    # Black
-        if abs(r-g) < 15 and abs(g-b) < 15: return False # Gray
-        return True
-
-    def _vector_radar_probe(self, spatial_index: SpatialIndex, text_bbox, search_rect) -> Optional[Tuple[str, int, Tuple[int,int,int]]]:
-        """
-        Refined Vector Radar using Spatial Index + Edge-to-Edge Distance.
-        Returns: (Hex, Score, RGB)
-        """
-        candidates = []
-        t_rect = fitz.Rect(text_bbox)
-        nearby_shapes = spatial_index.query(search_rect)
-        MAX_BINDING_DIST = 150.0
-
-        for shape in nearby_shapes:
-            s_rect = fitz.Rect(shape['rect'])
-            if not s_rect.intersects(search_rect): continue
-            if shape.get('fill') is None: continue
-            
-            r, g, b = shape['fill']
-            rgb_255 = (int(r*255), int(g*255), int(b*255))
-            
-            if not self._is_valid_color(rgb_255): continue
-            if min(s_rect.width, s_rect.height) < 2.0: continue
-
-            dist = self._rect_distance(t_rect, s_rect)
-            if dist > MAX_BINDING_DIST: continue
-            
-            score = dist 
-            hex_c = '#{:02x}{:02x}{:02x}'.format(*rgb_255)
-            candidates.append((hex_c, score, rgb_255))
-            
-        if not candidates: return None
-        candidates.sort(key=lambda x: x[1])
-        return candidates[0]
-
-    # --- RASTER PROBE HELPERS ---
-
-    def _scan_direction(self, img: Image.Image, box: tuple, direction: str, gap_tolerance: int = 15) -> Optional[Tuple[str, int, Tuple[int,int,int]]]:
-        """Gap Tolerant Ray Casting."""
-        try:
-            safe_box = (max(0, math.floor(box[0])), max(0, math.floor(box[1])), 
-                        min(img.width, math.ceil(box[2])), min(img.height, math.ceil(box[3])))
-            l, t, r, b = safe_box
-            w, h = img.size
-            if r <= l or b <= t: return None
-
-            def check_pixel(px, py):
-                if 0 <= px < w and 0 <= py < h:
-                    c = img.getpixel((px, py))
-                    # Check against simple valid color logic
-                    if self._is_valid_color(c[:3]):
-                        return ('#{:02x}{:02x}{:02x}'.format(*c[:3]), c[:3])
-                return None
-
-            if direction == "left":
-                for x in range(l - 1, max(-1, l - gap_tolerance), -1):
-                    for y in range(t, b):
-                        if res := check_pixel(x, y): return (res[0], l - x, res[1])
-            elif direction == "right":
-                for x in range(r, min(w, r + gap_tolerance)):
-                    for y in range(t, b):
-                        if res := check_pixel(x, y): return (res[0], x - r, res[1])
-            elif direction == "bottom":
-                for y in range(b, min(h, b + gap_tolerance)):
-                    for x in range(l, r):
-                        if res := check_pixel(x, y): return (res[0], y - b, res[1])
-            return None 
-        except Exception: return None
-
-    # --- MAIN VISUAL PROCESSOR ---
-
-    @traceable(name="Process Visual (Cascade)", run_type="chain")
-    async def _process_visual(self, item: DocItem, doc, pdf_doc, doc_hash: str, filename: str) -> Optional[IngestedChunk]:
-        if not item.prov: return None
-        prov = item.prov[0]
-        page_no = prov.page_no
-        bbox = prov.bbox 
-
-        try:
-            # 1. Image Extraction (Threaded & Stateless)
-            page_ref = doc.pages[page_no].image
-            if not page_ref or not page_ref.pil_image: return None
-            
-            loop = asyncio.get_running_loop()
-            
-            def _crop_in_memory():
-                page_img = page_ref.pil_image
-                pdf_w, pdf_h = doc.pages[page_no].size.width, doc.pages[page_no].size.height
-                img_w, img_h = page_img.size
-                scale_x, scale_y = img_w / pdf_w, img_h / pdf_h
+        # --- STEP 2: VLM SINGLE PASS (Charts + Page Context) ---
+        # We open the PDF again with Fitz to render high-res images for the Vision pipeline
+        with fitz.open(file_path) as pdf_doc:
+            for page_num, page in enumerate(pdf_doc, start=1):
+                logger.info(f"--- Processing Page {page_num} (VLM) ---")
                 
-                px_l, px_t = bbox.l * scale_x, (pdf_h - bbox.t) * scale_y
-                px_r, px_b = bbox.r * scale_x, (pdf_h - bbox.b) * scale_y
+                # Render Image
+                zoom = 3.0 # High Res
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                pil_img = Image.open(io.BytesIO(pix.tobytes("png")))
                 
-                PAD = 60
-                crop_box = (int(max(0, px_l-PAD)), int(max(0, min(px_t, px_b)-PAD)), 
-                            int(min(img_w, px_r+PAD)), int(min(img_h, max(px_t, px_b)+PAD)))
-                
-                cropped = page_img.crop(crop_box)
-                out_bytes = io.BytesIO()
-                # Save as PNG initially to preserve quality before analysis; VisionTool will convert if needed.
-                cropped.save(out_bytes, format='PNG') 
-                return out_bytes.getvalue(), scale_x, scale_y, crop_box[0], crop_box[1]
+                # Base64 for VLM
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG")
+                img_bytes = buf.getvalue()
+                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-            # [ASYNC] Offload Crop
-            img_bytes, scale_x, scale_y, crop_off_x, crop_off_y = await loop.run_in_executor(None, _crop_in_memory)
-            
-            # 2. Vector Probe Setup
-            fitz_page = pdf_doc.load_page(page_no - 1)
-            clip_rect = self._get_safe_clip_rect(bbox, fitz_page.rect)
-            
-            # The "Periscope": Define a search area LARGER than the visual to find legends
-            SEARCH_PAD = 150
-            search_rect = fitz.Rect(
-                max(0, clip_rect.x0 - SEARCH_PAD), 
-                max(0, clip_rect.y0 - SEARCH_PAD),
-                min(fitz_page.rect.width, clip_rect.x1 + SEARCH_PAD),
-                min(fitz_page.rect.height, clip_rect.y1 + SEARCH_PAD)
-            )
-            
-            # [OPTIMIZATION] Build Spatial Index
-            spatial_index = SpatialIndex(fitz_page.rect)
-            for d in fitz_page.get_drawings(): spatial_index.insert(d)
-            
-            vector_data = fitz_page.get_text("dict", clip=clip_rect, flags=fitz.TEXT_PRESERVE_IMAGES)
-            text_items = []
-            method = "vector"
-            
-            for block in vector_data.get("blocks", []):
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        if self._is_text_visible(span):
-                            bx0, by0, bx1, by1 = span["bbox"]
-                            px0, py0 = (bx0 * scale_x) - crop_off_x, (by0 * scale_y) - crop_off_y
-                            px1, py1 = (bx1 * scale_x) - crop_off_x, (by1 * scale_y) - crop_off_y
-                            text_items.append({
-                                'text': span["text"], 'bbox': [px0, py0, px1, py1],
-                                'raw_bbox': fitz.Rect(bx0, by0, bx1, by1)
-                            })
+                # A. Layout Scout (Visual Detection)
+                layout = await layout_scanner.scan(img_b64)
 
-            # 3. Raster Fallback (Threaded) [CRITICAL SAFETY NET PRESERVED]
-            if len(text_items) < 5:
-                method = "raster"
-                # [ASYNC] Offload OCR
-                def _ocr_task(): return self.ocr_engine(np.array(Image.open(io.BytesIO(img_bytes))))
-                ocr_results, _ = await loop.run_in_executor(_OCR_EXECUTOR, _ocr_task)
-                if ocr_results:
-                    for line in ocr_results:
-                        poly, text, _ = line
-                        xs, ys = [p[0] for p in poly], [p[1] for p in poly]
-                        text_items.append({'text': text, 'bbox': [min(xs), min(ys), max(xs), max(ys)]})
+                # B. OCR Grid (Raster Spatial Map)
+                ocr_context = self._extract_text_spatial(np.array(pil_img))
 
-            # 4. Semantic Binding (THE FIX: Separate Legends vs Data)
-            raw_legend_bindings = []
-            data_point_hints = []
-            
-            for t_item in text_items:
-                if not t_item['text'].strip(): continue
-                text_clean = t_item['text'].strip()
+                # C. Vector Hints (The "Gold" - Legend Colors)
+                # [UPDATED CALL] Now passing layout
+                vector_hints = self._generate_vector_hints(page, layout=layout)
                 
-                # [LOGIC SPLIT]
-                # Is it a number? (Data Point)
-                is_numeric = any(c.isdigit() for c in text_clean) and len(text_clean) < 10
-                
-                candidates = []
-                
-                if method == "vector" and 'raw_bbox' in t_item:
-                    match = self._vector_radar_probe(spatial_index, t_item['raw_bbox'], search_rect)
-                    if match: candidates.append(("VectorMatch", match[1], match[2], match[0]))
-                else:
-                    l, t, r, b = t_item['bbox']
-                    PROBE_DIST = int(60 * scale_x)
-                    for d in [("left", (l-PROBE_DIST, t, l, b)), ("right", (r, t, r+PROBE_DIST, b))]:
-                        res = self._scan_direction(Image.open(io.BytesIO(img_bytes)), d[1], d[0])
-                        if res: candidates.append((d[0], res[1], res[2], res[0]))
+                full_context_str = f"[OCR SPATIAL GRID]\n{ocr_context}\n\n[VECTOR LEGEND HINTS]\n{vector_hints}"
 
-                if candidates:
-                    candidates.sort(key=lambda x: x[1])
-                    best = candidates[0]
-                    # Hex = best[3], RGB = best[2]
+                # D. Forensic Analysis (Auditor)
+                # IMPORTANT: vision_tool must be updated to support 'analyze_full_page'
+                analysis = await vision_tool.analyze_full_page(
+                    image_data=img_bytes,
+                    ocr_context=full_context_str,
+                    layout_hint=layout
+                )
+
+                if analysis:
+                    # Package Page Analysis
+                    content_buffer = [f"## Page {page_num}: {analysis.title}"]
+                    content_buffer.append(f"**Summary:** {analysis.summary}\n")
                     
-                    if is_numeric:
-                        # It's a Data Point -> Store as "Hint" not "Legend"
-                        # "Value '20766' is on Dark Red"
-                        # We use the raw Hex for this, LLM matches it to the Resolved Legend
-                        data_point_hints.append(f"Data Point: '{text_clean}' is on/near {best[3]}")
-                    else:
-                        # It's Text -> Potential Legend
-                        raw_legend_bindings.append((text_clean, best[2], best[3]))
+                    if analysis.metrics:
+                        content_buffer.append("### Key Metrics:")
+                        for m in analysis.metrics:
+                            # [UPDATED] Robust String Formatter for New Schema
+                            # Logic: {Currency}{Value}{Magnitude} {Measure} (Handling "None")
+                            
+                            points_list = []
+                            for p in m.data_points:
+                                cur = p.currency if p.currency != "None" else ""
+                                mag = p.magnitude if p.magnitude != "None" else ""
+                                meas = p.measure if p.measure != "None" else ""
+                                val_str = f"{cur}{p.numeric_value}{mag} {meas}".strip()
+                                points_list.append(f"{p.label}={val_str}")
+                                
+                            points = ", ".join(points_list)
+                            content_buffer.append(f"- **{m.series_label}:** {points}")
+                    
+                    if analysis.insights:
+                        content_buffer.append("\n### Insights:")
+                        for ins in analysis.insights:
+                            content_buffer.append(f"- [{ins.category}] {ins.content}")
 
-            # 5. Resolve Shades (Only for Legends)
-            resolved_legends = ColorResolver.resolve_names(raw_legend_bindings)
+                    full_text = "\n".join(content_buffer)
+                    
+                    chunk = IngestedChunk(
+                        chunk_id=str(uuid4()),
+                        doc_hash=doc_hash,
+                        page_number=page_num,
+                        clean_text=full_text,
+                        raw_text=ocr_context,
+                        token_count=len(full_text.split()),
+                        metadata={
+                            "source": file_path.name,
+                            "confidence": analysis.confidence_score,
+                            "has_charts": layout.has_charts,
+                            "audit_log": analysis.audit_log,
+                            "type": "visual_analysis"
+                        }
+                    )
+                    chunks.append(chunk)
 
-            # 6. Classify & Analyze
-            classification_result = classify_region(text_items)
-            mode = classification_result["decision"]
-            item_label = getattr(item, "label", None)
-            if item_label is None and isinstance(item, dict): item_label = item.get("label")
-            label_str = item_label.value.lower() if hasattr(item_label, "value") else str(item_label).lower()
-            if any(x in label_str for x in ["chart", "figure"]) and text_items: mode = "chart"
+        logger.info(f"✅ Extracted {len(chunks)} chunks from {file_path.name}")
+        return chunks
 
-            full_context = (
-                f"DETECTED LEGENDS (Definitions):\n{list(set(resolved_legends))}\n\n"
-                f"DATA POINT LOCATION HINTS:\n{data_point_hints[:30]}\n" # Limit to avoid context overflow
-                f"LAYOUT: {classification_result['evidence']['layout_structure']}"
-            )
-
-            description = await vision_tool.analyze(
-                image_data=img_bytes, 
-                mode=mode, 
-                context=full_context
-            )
-            
-            chunk_id = str(uuid4())
-            caption_str = ""
-            if hasattr(item, "captions") and item.captions:
-                caption_str = " | ".join([c.text for c in item.captions])
-
-            return IngestedChunk(
-                chunk_id=chunk_id, doc_hash=doc_hash,
-                clean_text=f"[{mode.upper()} ANALYSIS]\nTitle: {caption_str}\n{description}", 
-                raw_text=description, page_number=page_no, token_count=len(description.split()),
-                metadata={"source": filename, "type": "visual", "mode": mode}
-            )
-
-        except Exception as e:
-            logger.error(f"Visual processing failed: {e}")
-            return None
+pdf_parser = PDFParser()

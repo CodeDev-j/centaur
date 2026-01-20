@@ -13,8 +13,9 @@ class SystemConfig:
     DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "OPENAI_DEV")
     
     # Model Selection
-    VISION_MODEL = os.getenv("VISION_MODEL_NAME", "gpt-4o")
-    REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4o")
+    LAYOUT_MODEL = os.getenv("LAYOUT_MODEL_NAME", "gpt-4.1-mini")
+    VISION_MODEL = os.getenv("VISION_MODEL_NAME", "gpt-4.1")
+    REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4.1-mini")
     EMBEDDING_MODEL = "fastembed" # Keeping your explicit definition
     
     # Infrastructure (REQUIRED for Docker connection)
