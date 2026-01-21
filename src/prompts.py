@@ -12,7 +12,7 @@ Task: Detect visualizations, define inclusive bounding boxes (BBox), and extract
 
 1. **Detection & Bounding (GREEDY STRATEGY):**
    - **Scope:** BBox MUST include Chart Title, Graphic, Legend, and ALL Axis Labels.
-   - **Vertical Extension:** In financial slides, X-Axis labels often reside at the very bottom (footer area). Extend BBox vertically to capture them.
+   - **Vertical Extension:** In financial slides, X-Axis labels often reside at the very bottom (footer area). Extend BBox vertically to capture "Table Rows" below the axis (e.g., "Y/Y Growth", "Margin %").
    - **Floating Elements:** Detect "Satellite" numbers connected by thin pointer lines or floating outside main bars. These are CRITICAL. Include them in the BBox.
    - **Grouping Logic:**
      - Distinct Charts (e.g., Top vs. Bottom): Create separate regions.
@@ -27,19 +27,20 @@ Task: Detect visualizations, define inclusive bounding boxes (BBox), and extract
      - `axis_labels`: All years/categories on the axis.
      - `legend_keys`: All series names.
      - `aggregates`: The "Result" numbers.
-       - *Stacked Bar:* The floating sum on top.
+       - *Stacked Bar:* The total stack value (Sum). Usually floating above the bar, but distinct from the top-most segment label. Typically the largest value associated with a bar.
        - *Waterfall:* The final "landing" bar (e.g., Ending EBIT).
        - *Donut:* The value inside the hole.
        - *Table:* The "Total" or "Grand Total" row.
      - `constituents`: The "Driver" numbers.
-       - *Stacked Bar:* The segments inside the bar.
+       - *Stacked Bar:* The segments that make up the bar. Values are frequently inside the bars, but can sometimes be next to bars or above the bars (including above `aggregates` sometimes). Floating constituents can be distinguished from `aggregates` based on numerical size.
        - *Waterfall:* The floating steps (Delta, FX, Vol).
        - *General:* All other granular numbers (including Growth % rows below or next to axis).
+       - *The "Spider Leg" Rule:* You MUST extract any values connected to small bars by thin lines (e.g., `-$0.5B`, `1.2%`). Even if they look like negatives due to the line, capture them EXACTLY as text.
    - **Sparse Data Rule:** If a datapoint is visually blank, SKIP IT. Do not hallucinate '0' or 'N/A'.
 
 3. **Metadata Integrity (ANTI-HALLUCINATION):**
-   - **Footnotes:** Only extract text explicitly marked as a footnote or source at the bottom.
-   - **Titles:** If a chart has no clear title, leave the field empty string `""`.
+   - **Footnotes:** Only extract text explicitly marked as a footnote or source at the bottom. If none exist, return an empty list `[]`.
+   - **Titles:** If a chart has no clear title, leave the field empty string `""`. Do not invent a title based on your interpretation of the data.
 
 4. **Validation & Structural Analysis:**
    - **Count Check:** Verify that the count of `constituents` aligns logically with the count of `axis_labels` and `legend_keys`.
@@ -73,8 +74,9 @@ You are an Adversarial Forensic Auditor. Your goal is to extract "Ground Truth" 
    - **Synthetic Series (The "Total" Rule):** IF floating totals appear above stacked bars or at the end of waterfalls, YOU MUST create a separate `MetricSeries`.
      - **Naming Convention:** Label it `"Total " + {Context}` (e.g., "Total Wearables Market", "Total Revenue"). Do NOT just call it "Total".
    - **Data Extraction:** Extract every visible number as a `DataPoint`.
-   - **Negative Values:** Treat parentheses `(100)` as negative `-100.0`. Do NOT simply remove them.
-   - **Periodicity:** Detect the time basis (FY, Q, 9M, LTM) from the chart title/headers and set the `periodicity` field.
+   - **Negative Values:** Treat parentheses `(100)` as negative `-100.0`. 
+     - **EXCEPTION (The "Pointer Line" Trap):** In Stacked Bar Charts, if a label appears as `-$1.7` or `-1.7`, the minus sign is likely a visual connector line misinterpreted by OCR. Use **Summation Logic** to verify. If `Total ≈ Sum(Known) + 1.7`, treat it as POSITIVE `1.7`.
+   - **Periodicity:** - 1. Set the Page Default (e.g., 'Q'). 2. IF a specific series differs (e.g. 'LTM', 'FY'), OVERRIDE it in the `MetricSeries.periodicity` field.
 2. **IF CONCEPT/TEXT SLIDE:** Extract data into the `insights` list.
    - Used for diagrams like "Ratings Procedures" or "Strategy Pillars".
    - Do not force text bullets into numeric fields.
@@ -177,6 +179,7 @@ You must validate the **Semantic Type** of text before assigning it as a Label.
    - *Correction:* If OCR says "20" but the bar is visually tiny (5%), the OCR could be wrong. **Trust the Visual Proportion.**
 2. **Summation Logic (Stacked):** Sum(Segments) must ≈ Total Bar Value.
    - *Anti-Hallucination:* If Sum << Total, you missed a segment. **DO NOT** invent a number to fill the gap. Search adjacent space for the missing value.
+   - *Strict Prohibition:* **DO NOT** copy values from adjacent years (e.g. do not assume 2020 is 4.9 just because 2019 was 4.9). Search strictly within the column's spatial zone.
    - *Duplicate Check:* If two segments in the same year have the EXACT same value (e.g. 3.4 and 3.4), verify they are not the same OCR token mapped twice.
 3. **The "Bridge Check" (Waterfalls):** Start + Deltas ≈ End. (Respect negatives!)
 

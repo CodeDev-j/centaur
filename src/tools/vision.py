@@ -1,28 +1,90 @@
+import asyncio
+import atexit
 import base64
 import io
 import logging
-import asyncio
+import os
 import random
-from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Dict, Any, Union, Literal
-from pydantic import BaseModel, Field
+from functools import wraps
+from typing import List, Literal, Optional
 
 # Third-party
-from PIL import Image, ImageEnhance
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from langsmith import traceable
+from PIL import Image, ImageEnhance
+from pydantic import BaseModel, Field
 
 # Internal
 from src.config import SystemConfig
 from src.prompts import PROMPT_FINANCIAL_FORENSIC
-from src.tools.layout_scanner import PageLayout  # Needed for type hinting
+from src.schemas.layout import PageLayout
 
 logger = logging.getLogger(__name__)
 
-# Dedicated thread pool for CPU-bound image operations
-_IMG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+# ==============================================================================
+# ⚙️ CONFIGURATION
+# ==============================================================================
+VISION_TEMPERATURE = 0.0
+VISION_MAX_TOKENS = 3500
+VISION_TIMEOUT = 300  # seconds
+RETRY_COUNT = 3
+RETRY_BACKOFF = 1  # seconds
+
+# ==============================================================================
+# ⚙️ RESOURCE MANAGEMENT
+# ==============================================================================
+# Determine worker count based on CPU cores, capped at 4 for image ops
+_MAX_WORKERS = min(4, (os.cpu_count() or 1))
+_IMG_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+
+# Best Practice: Ensure thread pool is closed on program exit
+def _shutdown_executor():
+    _IMG_EXECUTOR.shutdown(wait=False)
+
+atexit.register(_shutdown_executor)
+
+# ==============================================================================
+# 🛡️ RESILIENCE UTILS
+# ==============================================================================
+def async_retry_with_backoff(retries: int = 3, backoff_in_seconds: int = 1):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            x = 0
+            while True:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    if x == retries:
+                        logger.error(f"Vision Analysis Failed after {retries} retries: {e}")
+                        return None  # Return None on failure to allow graceful degradation
+                    
+                    # Non-blocking sleep allows other tasks to run during backoff
+                    sleep_time = (backoff_in_seconds * 2 ** x) + random.uniform(0, 1)
+                    logger.warning(f"Vision Error: {e}. Retrying in {sleep_time:.2f}s...")
+                    await asyncio.sleep(sleep_time)
+                    x += 1
+        return wrapper
+    return decorator
+
+# ==============================================================================
+# 🧩 SHARED TYPES
+# ==============================================================================
+# Define Periodicity once to enforce consistency across Page and Series levels
+PeriodicityType = Literal[
+    "FY",   # Fiscal Year / Annual
+    "Q",    # Quarterly
+    "H",    # Half-Yearly (H1/H2)
+    "9M",   # Nine Months (Common in Q3 reporting)
+    "M",    # Monthly
+    "W",    # Weekly
+    "LTM",  # Last Twelve Months
+    "YTD",  # Year to Date
+    "Other",
+    "Unknown"
+]
 
 # ==============================================================================
 # 📊 STRUCTURED OUTPUT SCHEMAS
@@ -67,6 +129,13 @@ class DataPoint(BaseModel):
 
 class MetricSeries(BaseModel):
     series_label: str = Field(..., description="The name of the series (from Legend or Label).")
+    
+    # [DRY FIXED] Reusing PeriodicityType
+    periodicity: Optional[PeriodicityType] = Field(
+        default=None,
+        description="Specific time basis for this series (e.g. 'LTM') if different from the global page default."
+    )
+    
     data_points: List[DataPoint] = Field(default_factory=list)
 
 class Insight(BaseModel):
@@ -78,21 +147,10 @@ class ChartAnalysis(BaseModel):
     title: str = Field(default="Untitled Analysis", description="Title of the analysis.")
     summary: str = Field(..., description="High-level summary of the visual data.")
     
-    # [UPDATED] Periodicity Field with 9M and W
-    periodicity: Literal[
-        "FY",   # Fiscal Year / Annual
-        "Q",    # Quarterly
-        "H",    # Half-Yearly (H1/H2)
-        "9M",   # Nine Months (Common in Q3 reporting)
-        "M",    # Monthly
-        "W",    # Weekly
-        "LTM",  # Last Twelve Months
-        "YTD",  # Year to Date
-        "Other",
-        "Unknown"
-    ] = Field(
+    # [DRY FIXED] Reusing PeriodicityType
+    periodicity: PeriodicityType = Field(
         default="Unknown",
-        description="The time basis of the data. FY=Fiscal Year, Q=Quarterly, 9M=Nine Months, LTM=Last 12 Months."
+        description="The DOMINANT time basis of the page. Individual series can override this. FY=Fiscal Year, Q=Quarterly, 9M=Nine Months, LTM=Last 12 Months."
     )
     
     metrics: List[MetricSeries] = Field(default_factory=list, description="Extracted quantitative data.")
@@ -103,35 +161,14 @@ class ChartAnalysis(BaseModel):
 # ==============================================================================
 # 👁️ VISION TOOL
 # ==============================================================================
-def async_retry_with_backoff(retries=3, backoff_in_seconds=1):
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            x = 0
-            while True:
-                try:
-                    return await func(*args, **kwargs)
-                except Exception as e:
-                    if x == retries:
-                        logger.error(f"Failed after {retries} retries: {e}")
-                        return None # Return None on failure to allow graceful degradation
-                    
-                    # [FIX] Non-blocking sleep allows other tasks to run during backoff
-                    sleep_time = (backoff_in_seconds * 2 ** x) + random.uniform(0, 1)
-                    logger.warning(f"Vision Error: {e}. Retrying in {sleep_time:.2f}s...")
-                    await asyncio.sleep(sleep_time)
-                    x += 1
-        return wrapper
-    return decorator
-
 class VisionTool:
     def __init__(self):
         # Use LangChain wrapper for better tracing in LangSmith
         self.vlm = ChatOpenAI(
             model=SystemConfig.VISION_MODEL,
-            temperature=0.0,
-            max_tokens=3500,  # Higher token limit for dense data extraction
-            request_timeout=300 
+            temperature=VISION_TEMPERATURE,
+            max_tokens=VISION_MAX_TOKENS,  # Higher token limit for dense data extraction
+            request_timeout=VISION_TIMEOUT
         ).with_structured_output(ChartAnalysis)
         
         logger.info(f"👁️ Vision Tool initialized with model: {SystemConfig.VISION_MODEL}")
@@ -181,7 +218,7 @@ class VisionTool:
             raise
 
     @traceable(name="Vision Analysis", run_type="tool")
-    @async_retry_with_backoff(retries=3)
+    @async_retry_with_backoff(retries=RETRY_COUNT, backoff_in_seconds=RETRY_BACKOFF)
     async def analyze_full_page(self, 
                               image_data: bytes, 
                               ocr_context: str, 
@@ -209,10 +246,10 @@ class VisionTool:
         if layout_hint and layout_hint.charts:
             for i, chart in enumerate(layout_hint.charts):
                 scout_summary += (
-                    f"- Region {i+1}: {chart.chart_type} | Title: '{chart.title}' | "
-                    # Inject the Scout's detected legends to guide the model
+                    f"- Region {i+1} (Box: {chart.bbox}): {chart.chart_type} | Title: '{chart.title}' | "
                     f"Legend Keys: {chart.legend_keys} | " 
                     f"Possible Values: {chart.constituents} | "
+                    f"Hints - Aggregates: {chart.aggregates} | "
                     f"Possible Labels: {chart.axis_labels}\n"
                 )
         else:
@@ -224,7 +261,7 @@ class VisionTool:
             f"=== INSTRUCTION ===\n"
             f"Use the Spatial Anchors to lock onto the Scout's regions. "
             f"Extract the 'Ground Truth' numbers. "
-            f"Detect the Periodicity (FY, Q, 9M, LTM) from the title/headers. "
+            f"Detect the Page Default Periodicity (FY, Q, etc.). If a specific series differs, OVERRIDE it at the series level. "
             f"If OCR and Visuals disagree, TRUST THE VISUALS (Bar Height/Position)."
         )
 
