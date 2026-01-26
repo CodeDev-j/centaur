@@ -1,3 +1,12 @@
+"""
+Vision Tool implementation for the Financial Forensic Pipeline.
+Handles image processing, VLM invocation, and structured schema definitions.
+"""
+
+# ==============================================================================
+# 👁️ VISION TOOL - vision.py
+# ==============================================================================
+
 import asyncio
 import atexit
 import base64
@@ -39,11 +48,14 @@ RETRY_BACKOFF = 1  # seconds
 _MAX_WORKERS = min(4, (os.cpu_count() or 1))
 _IMG_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
 
+
 # Best Practice: Ensure thread pool is closed on program exit
 def _shutdown_executor():
     _IMG_EXECUTOR.shutdown(wait=False)
 
+
 atexit.register(_shutdown_executor)
+
 
 # ==============================================================================
 # 🛡️ RESILIENCE UTILS
@@ -58,54 +70,76 @@ def async_retry_with_backoff(retries: int = 3, backoff_in_seconds: int = 1):
                     return await func(*args, **kwargs)
                 except Exception as e:
                     if x == retries:
-                        logger.error(f"Vision Analysis Failed after {retries} retries: {e}")
-                        return None  # Return None on failure to allow graceful degradation
-                    
+                        logger.error(
+                            f"Vision Analysis Failed after {retries} "
+                            f"retries: {e}"
+                        )
+                        return None  # Return None to allow graceful degradation
+
                     # Non-blocking sleep allows other tasks to run during backoff
-                    sleep_time = (backoff_in_seconds * 2 ** x) + random.uniform(0, 1)
-                    logger.warning(f"Vision Error: {e}. Retrying in {sleep_time:.2f}s...")
+                    sleep_time = (
+                        (backoff_in_seconds * 2 ** x) + random.uniform(0, 1)
+                    )
+                    logger.warning(
+                        f"Vision Error: {e}. Retrying in {sleep_time:.2f}s..."
+                    )
                     await asyncio.sleep(sleep_time)
                     x += 1
         return wrapper
     return decorator
+
 
 # ==============================================================================
 # 🧩 SHARED TYPES
 # ==============================================================================
 # Define Periodicity once to enforce consistency across Page and Series levels
 PeriodicityType = Literal[
-    "FY",   # Fiscal Year / Annual
-    "Q",    # Quarterly
-    "H",    # Half-Yearly (H1/H2)
-    "9M",   # Nine Months (Common in Q3 reporting)
-    "M",    # Monthly
-    "W",    # Weekly
-    "LTM",  # Last Twelve Months
-    "YTD",  # Year to Date
+    "FY",     # Fiscal Year / Annual
+    "Q",      # Quarterly
+    "H",      # Half-Yearly (H1/H2)
+    "9M",     # Nine Months (Common in Q3 reporting)
+    "M",      # Monthly
+    "W",      # Weekly
+    "LTM",    # Last Twelve Months
+    "YTD",    # Year to Date
+    "Mixed",  # Explicit support for mixed timeframes (e.g. Q1, Q2, YTD)
     "Other",
     "Unknown"
 ]
+
 
 # ==============================================================================
 # 📊 STRUCTURED OUTPUT SCHEMAS
 # ==============================================================================
 class DataPoint(BaseModel):
-    label: str = Field(..., description="The X-axis label (e.g., '2024', 'Q1', 'Bridge').")
-    
+    label: str = Field(
+        ...,
+        description="The X-axis label (e.g., '2024', 'Q1', 'Bridge')."
+    )
+
     # 1. The Raw Number (Strictly no math)
-    numeric_value: float = Field(..., description="The numeric value exactly as seen. Example: If text is '$12.4B', extract 12.4.")
-    
+    numeric_value: float = Field(
+        ...,
+        description=(
+            "The numeric value exactly as seen. Example: If text is "
+            "'$12.4B', extract 12.4."
+        )
+    )
+
     # 2. Currency (Strict List - Liquid 15)
     # Critical for FX normalization downstream.
     currency: Literal[
-        "USD", "EUR", "GBP", "JPY", "CNY", "CAD", "AUD", "CHF", "INR", 
-        "HKD", "SGD", "NZD", "KRW", "SEK", "BRL", 
+        "USD", "EUR", "GBP", "JPY", "CNY", "CAD", "AUD", "CHF", "INR",
+        "HKD", "SGD", "NZD", "KRW", "SEK", "BRL",
         "None"
     ] = Field(
-        default="None", 
-        description="ISO 4217 Code. Infer from symbol context (e.g. '$' in Singapore -> SGD)."
+        default="None",
+        description=(
+            "ISO 4217 Code. Infer from symbol context (e.g. '$' in "
+            "Singapore -> SGD)."
+        )
     )
-    
+
     # 3. Magnitude (Strict List - Universal Scalers)
     # Critical to prevent 'zero-counting' hallucinations.
     magnitude: Literal[
@@ -114,49 +148,112 @@ class DataPoint(BaseModel):
         "%", "x", "bps",    # Ratios
         "None"
     ] = Field(
-        default="None", 
-        description="Scaler. Map 'mn/mm'->M, 'bn'->B. Map 'GW'->Mag='G', Measure='W'."
+        default="None",
+        description=(
+            "Scaler. Map 'mn/mm'->M, 'bn'->B. Map 'GW'->Mag='G', "
+            "Measure='W'."
+        )
     )
-    
+
     # 4. Measure (Flexible String - The "Escape Hatch")
     # Allows for niche KPIs (TEU, boe, oz, subscribers) without schema errors.
     measure: str = Field(
-        default="None", 
-        description="Operational unit (e.g., 'sqft', 'bbl', 'users', 't'). Keep concise."
+        default="None",
+        description=(
+            "Operational unit (e.g., 'sqft', 'bbl', 'users', 't'). "
+            "Keep concise."
+        )
     )
-    
-    original_text: str = Field(default="", description="The raw text seen on the chart for audit (e.g. '$12.4B').")
 
-class MetricSeries(BaseModel):
-    series_label: str = Field(..., description="The name of the series (from Legend or Label).")
-    
-    # [DRY FIXED] Reusing PeriodicityType
+    # 5. Atomic Periodicity Override [HIERARCHY PRIORITY 1]
     periodicity: Optional[PeriodicityType] = Field(
         default=None,
-        description="Specific time basis for this series (e.g. 'LTM') if different from the global page default."
+        description=(
+            "ATOMIC OVERRIDE: If the 'label' text explicitly contains 'YTD', "
+            "'FY', 'LTM', or '9M', you MUST set this field to match. "
+            "IF the label implies a quarter (e.g. 'Q3'), set 'Q'. "
+            "CRITICAL: If the label text is missing or unclear, leave this "
+            "as None. Do NOT guess or hallucinate a tag without text evidence."
+        )
     )
-    
+
+    original_text: str = Field(
+        default="",
+        description="The raw text seen on the chart for audit (e.g. '$12.4B')."
+    )
+
+
+class MetricSeries(BaseModel):
+    series_label: str = Field(
+        ...,
+        description=(
+            "The name of the series. For Chart Lines/Bars, use the Legend. "
+            "For Table/Memo rows below the chart, use the Row Header "
+            "exactly (e.g. 'Memo: JV Wholesales')."
+        )
+    )
+
+    # [HIERARCHY PRIORITY 2]
+    # Updated to enforce Semantic Context from Prompt logic
+    periodicity: Optional[PeriodicityType] = Field(
+        default=None,
+        description=(
+            "SEMANTIC OVERRIDE: Check the Chart Title or Header. "
+            "If it says 'LTM' or 'Monthly', set this field accordingly "
+            "to override the Page Default."
+        )
+    )
+
     data_points: List[DataPoint] = Field(default_factory=list)
 
+
 class Insight(BaseModel):
-    category: str = Field(..., description="Type: 'Trend', 'Risk', 'Anomaly', 'Strategy'.")
+    category: str = Field(
+        ...,
+        description="Type: 'Trend', 'Risk', 'Anomaly', 'Strategy'."
+    )
     topic: str = Field(..., description="Subject (e.g., 'EBITDA Growth').")
-    content: str = Field(..., description="The concise insight derived from the visual.")
+    content: str = Field(
+        ...,
+        description="The concise insight derived from the visual."
+    )
+
 
 class ChartAnalysis(BaseModel):
-    title: str = Field(default="Untitled Analysis", description="Title of the analysis.")
-    summary: str = Field(..., description="High-level summary of the visual data.")
-    
-    # [DRY FIXED] Reusing PeriodicityType
+    title: str = Field(
+        default="Untitled Analysis",
+        description="Title of the analysis."
+    )
+    summary: str = Field(
+        ...,
+        description="High-level summary of the visual data."
+    )
+
+    # [HIERARCHY PRIORITY 3]
+    # Page Default acts as the fallback if no overrides exist
     periodicity: PeriodicityType = Field(
         default="Unknown",
-        description="The DOMINANT time basis of the page. Individual series can override this. FY=Fiscal Year, Q=Quarterly, 9M=Nine Months, LTM=Last 12 Months."
+        description=(
+            "The DOMINANT time basis of the page. Individual series can "
+            "override this. FY=Fiscal Year, Q=Quarterly, 9M=Nine Months, "
+            "LTM=Last 12 Months."
+        )
     )
-    
-    metrics: List[MetricSeries] = Field(default_factory=list, description="Extracted quantitative data.")
-    insights: List[Insight] = Field(default_factory=list, description="Qualitative strategic takeaways.")
-    audit_log: str = Field(..., description="Step-by-step reasoning of how data was extracted.")
+
+    metrics: List[MetricSeries] = Field(
+        default_factory=list,
+        description="Extracted quantitative data."
+    )
+    insights: List[Insight] = Field(
+        default_factory=list,
+        description="Qualitative strategic takeaways."
+    )
+    audit_log: str = Field(
+        ...,
+        description="Step-by-step reasoning of how data was extracted."
+    )
     confidence_score: float = Field(..., description="0.0-1.0 certainty level.")
+
 
 # ==============================================================================
 # 👁️ VISION TOOL
@@ -167,13 +264,20 @@ class VisionTool:
         self.vlm = ChatOpenAI(
             model=SystemConfig.VISION_MODEL,
             temperature=VISION_TEMPERATURE,
-            max_tokens=VISION_MAX_TOKENS,  # Higher token limit for dense data extraction
+            max_tokens=VISION_MAX_TOKENS,  # Higher limit for dense extraction
             request_timeout=VISION_TIMEOUT
         ).with_structured_output(ChartAnalysis)
-        
-        logger.info(f"👁️ Vision Tool initialized with model: {SystemConfig.VISION_MODEL}")
 
-    def _process_image_bytes(self, img_bytes: bytes, max_dim: int = 3000) -> str:
+        logger.info(
+            f"👁️ Vision Tool initialized with model: "
+            f"{SystemConfig.VISION_MODEL}"
+        )
+
+    def _process_image_bytes(
+        self,
+        img_bytes: bytes,
+        max_dim: int = 3000
+    ) -> str:
         """
         CPU-bound processing: Resize, Enhance, and Encode to JPEG.
         Executed in a thread pool to avoid blocking the async event loop.
@@ -181,7 +285,8 @@ class VisionTool:
         try:
             with Image.open(io.BytesIO(img_bytes)) as img:
                 # 1. Handle Transparency
-                if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                if img.mode in ('RGBA', 'LA') or \
+                   (img.mode == 'P' and 'transparency' in img.info):
                     bg = Image.new('RGB', img.size, (255, 255, 255))
                     if img.mode != 'RGBA':
                         img = img.convert('RGBA')
@@ -190,26 +295,24 @@ class VisionTool:
                 else:
                     img = img.convert('RGB')
 
-                # 2. Boost Contrast (Helps separate light bars/gridlines from white background)
+                # 2. Boost Contrast (Helps separate light bars/gridlines)
                 # Factor 1.4 = +40% Contrast
                 enhancer = ImageEnhance.Contrast(img)
                 img = enhancer.enhance(1.4)
-                
+
                 # 3. Boost Sharpness (Helps OCR read small axis labels)
                 # Factor 1.5 = +50% Sharpness
                 enhancer = ImageEnhance.Sharpness(img)
                 img = enhancer.enhance(1.5)
                 # ---------------------------------
 
-                # Standard Resize Logic
-                # [FIX] INCREASED MAX_DIM TO 3000
-                # Previous 1500 limit was shrinking the 3x scaled images, causing fuzziness.
+                # Resize Logic
                 width, height = img.size
                 if max(width, height) > max_dim:
                     ratio = max_dim / max(width, height)
                     new_size = (int(width * ratio), int(height * ratio))
                     img = img.resize(new_size, Image.Resampling.LANCZOS)
-                
+
                 buffered = io.BytesIO()
                 img.save(buffered, format="JPEG", quality=85)
                 return base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -218,11 +321,16 @@ class VisionTool:
             raise
 
     @traceable(name="Vision Analysis", run_type="tool")
-    @async_retry_with_backoff(retries=RETRY_COUNT, backoff_in_seconds=RETRY_BACKOFF)
-    async def analyze_full_page(self, 
-                              image_data: bytes, 
-                              ocr_context: str, 
-                              layout_hint: PageLayout) -> Optional[ChartAnalysis]:
+    @async_retry_with_backoff(
+        retries=RETRY_COUNT,
+        backoff_in_seconds=RETRY_BACKOFF
+    )
+    async def analyze_full_page(
+        self,
+        image_data: bytes,
+        ocr_context: str,
+        layout_hint: PageLayout
+    ) -> Optional[ChartAnalysis]:
         """
         FORENSIC ANALYSIS ENTRY POINT
         Accepts the Full Page + Spatial Grid + Scout Hints.
@@ -246,23 +354,33 @@ class VisionTool:
         if layout_hint and layout_hint.charts:
             for i, chart in enumerate(layout_hint.charts):
                 scout_summary += (
-                    f"- Region {i+1} (Box: {chart.bbox}): {chart.chart_type} | Title: '{chart.title}' | "
-                    f"Legend Keys: {chart.legend_keys} | " 
-                    f"Possible Values: {chart.constituents} | "
-                    f"Hints - Aggregates: {chart.aggregates} | "
-                    f"Possible Labels: {chart.axis_labels}\n"
+                    f"- Region {i+1} (Box: {chart.bbox}): "
+                    f"{chart.chart_type} | "
+                    f"Title: '{chart.title}' | "
+                    f"Legend: {chart.legend_keys} | "
+                    f"X-Axis: {chart.x_axis_labels} | "
+                    f"LHS-Axis: {chart.y_axis_labels} | "
+                    f"RHS-Axis: {chart.rhs_y_axis_labels} | "
+                    f"Values: {chart.constituents} {chart.aggregates}\n"
                 )
         else:
-            scout_summary += "No specific charts detected, scan for embedded data tables or text logic."
+            scout_summary += (
+                "No specific charts detected, scan for embedded data tables "
+                "or text logic."
+            )
 
         final_prompt_context = (
-            f"=== STEP 1: SPATIAL ANCHORS (OCR) ===\n{ocr_context[:5000]}\n\n"  # Truncate if massive
-            f"=== STEP 2: SCOUT HINTS (VISUALS) ===\n{scout_summary}\n\n"
+            f"=== STEP 1: SPATIAL ANCHORS (OCR) ===\n"
+            f"{ocr_context[:5000]}\n\n"  # Truncate if massive
+            f"=== STEP 2: SCOUT HINTS (VISUALS) ===\n"
+            f"{scout_summary}\n\n"
             f"=== INSTRUCTION ===\n"
             f"Use the Spatial Anchors to lock onto the Scout's regions. "
             f"Extract the 'Ground Truth' numbers. "
-            f"Detect the Page Default Periodicity (FY, Q, etc.). If a specific series differs, OVERRIDE it at the series level. "
-            f"If OCR and Visuals disagree, TRUST THE VISUALS (Bar Height/Position)."
+            f"Detect the Page Default Periodicity (FY, Q, etc.). If a "
+            f"specific series differs, OVERRIDE it at the series level. "
+            f"If OCR and Visuals disagree, TRUST THE VISUALS "
+            f"(Bar Height/Position)."
         )
 
         # 3. Build Messages
@@ -270,8 +388,16 @@ class VisionTool:
             SystemMessage(content=PROMPT_FINANCIAL_FORENSIC),
             HumanMessage(
                 content=[
-                    {"type": "text", "text": final_prompt_context},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                    {
+                        "type": "text",
+                        "text": final_prompt_context
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    },
                 ]
             )
         ]
@@ -279,5 +405,6 @@ class VisionTool:
         # 4. Invoke VLM
         response = await self.vlm.ainvoke(messages)
         return response
+
 
 vision_tool = VisionTool()
