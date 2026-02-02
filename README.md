@@ -143,22 +143,24 @@ centaur/
 │   │   ├── qdrant.py           # Search Logic (The "Brain" uses this)
 │   │   ├── sidecar.py          # Context Window Manager
 │   │   └── term_injector.py    # Regex Definitions Extractor
-│   ├── schemas/                # [TYPE SAFETY] Shared Pydantic Models
+│   ├── schemas/                # [TYPE SAFETY] Shared Pydantic Models ("Cognitive Contracts")
 │   │   ├── citation.py         # "Pixel-Perfect" citation object
 │   │   ├── documents.py        # Chunk definitions
-│   │   └── state.py            # LangGraph state schema
+│   │   ├── layout.py           # The "Glance" Schema (Object Detection)
+│   │   ├── state.py            # LangGraph state schema
+│   │   └── vision_output.py    # The "Read" Schema (Financial Taxonomy)
 │   ├── storage/                # [THE THREE TRUTHS - WRITE]
 │   │   ├── blob_driver.py      # Content Truth (Writes to blobs/)
 │   │   ├── db_driver.py        # State Truth (Writes to Postgres)
 │   │   └── vector_driver.py    # Search Truth (Writes to Qdrant)
 │   ├── tools/                  # [AGENT TOOLS]
-│   │   ├── calculator.py       # Python Math Engine
 │   │   ├── database.py         # SQL Lookup Tool
-│   │   └── vision.py           # GPT-4o Visual Analysis Tool
-│   ├── utils/                  # [OBSERVABILITY]
-│   │   ├── resilience.py       # Retry decorators & JSON repair
-│   │   ├── telemetry.py        # Cost tracking
-│   │   └── tracing.py          # LangSmith connection
+│   │   ├── layout_scanner.py   # The "Air Traffic Controller" (Cheap VLM)
+│   │   └── vision.py           # The "Forensic Analyst" (Deep Vision VLM)
+│   ├── utils/                  # [LOGIC KERNELS]
+│   │   ├── colors.py           # Semantic Color Resolver (HSL/Luminance)
+│   │   ├── resilience.py       # Async Retries & JSON Repair
+│   │   └── spatial.py          # O(1) Spatial Hashing Grid
 │   └── workflows/              # [CLOUD BRAIN] LangGraph Logic
 │       ├── graph.py            # The State Machine Controller
 │       ├── router.py           # Semantic Intent Router

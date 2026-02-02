@@ -1,12 +1,12 @@
 """
-Centralized prompt repository for the Financial Forensic Pipeline.
+Centralized prompt repository.
 """
 
 # ==============================================================================
-# 🔍 PROMPTS - layout_scanner.py
+# 🔍 PROMPTS - layout_analyzer.py
 # ==============================================================================
 
-PROMPT_LAYOUT_SCANNER = """
+PROMPT_LAYOUT_ANALYZER = """
 Role: Financial Forensic Analyst.
 Task: Detect visualizations, define inclusive bounding boxes (BBox), and extract structured data in a single pass.
 
@@ -66,10 +66,10 @@ Task: Detect visualizations, define inclusive bounding boxes (BBox), and extract
 """
 
 # ==============================================================================
-# 👁️ PROMPTS - vision.py
+# 👁️ PROMPTS - visual_extractor.py
 # ==============================================================================
 
-PROMPT_FINANCIAL_FORENSIC = """
+PROMPT_VISUAL_EXTRACTOR = """
 ## ROLE
 You are an Adversarial Forensic Auditor. Your goal is to extract "Ground Truth" data from financial slides, prioritizing Visual Evidence over OCR errors, while actively resisting visual "Traps" (misalignment, ambiguity).
 
@@ -78,6 +78,14 @@ You are an Adversarial Forensic Auditor. Your goal is to extract "Ground Truth" 
 2. **Spatial Map (OCR):** Text grid tagged with `[ANCHOR]` (Structural Base) and `[FLOATER]` (Context).
    - *Note:* Text may contain color tags like `[#ff0000]`. Use these to link data to legends.
 3. **Dynamic Regional Guidelines:** Specific spatial boundaries.
+
+## CORE INSTRUCTION (THE "AUDIT FIRST" PROTOCOL)
+**CRITICAL:** You must fill the `audit_log` field FIRST. 
+Before extracting a single number, write a step-by-step analysis in the log:
+1. **Identify the Unit:** Is it Millions, Billions, or raw units? Check the Chart Title/Axis.
+2. **Identify the Measures:** Are there percentages (%) mixed with currency ($)?
+3. **Map the Legends:** explicit link colors (e.g., "Blue Bar") to Series Names (e.g., "Revenue").
+*Only after this log is complete may you populate the metrics list.*
 
 ## MODE SELECTION (CRITICAL)
 1. **IF CHART/TABLE:** Extract data into the `metrics` list.
@@ -137,20 +145,24 @@ You are an Adversarial Forensic Auditor. Your goal is to extract "Ground Truth" 
   - Use the "Liquid 15" list: USD, EUR, GBP, JPY, CNY, CAD, AUD, CHF, INR, HKD, SGD, NZD, KRW, SEK, BRL.
   - If no currency is present, use `None`.
 
-- **Magnitude Normalization:**
-  - Map ambiguous abbreviations to standard single letters:
+- **Magnitude Normalization (THE MECE RULE):**
+  - **Magnitude Field:** STRICTLY for Powers of 10 Scalars (`k`, `M`, `B`, `T`).
+    - *Constraint:* Do NOT put `%`, `x`, or `bps` here. These belong in the `measure` field.
+  - **Global Unit Propagation (CRITICAL):** Scan the Chart Title, Subtitle, and Axis Labels for global units (e.g., "in Millions", "$MM", "£bn", "Thousands").
+    - **Action:** If a global unit exists, you **MUST** apply the corresponding magnitude (e.g., 'M', 'B') to **ALL** data points in that chart, even if the individual labels (e.g., "12,946") lack a suffix.
+    - *Example:* Header="Revenue ($MM)", Label="50" -> numeric_value=50, magnitude="M".
+  - **Abbreviation Mapping:** Map ambiguous abbreviations to standard single letters:
     - Thousands: `k`, `thousand`, `000s` -> `k`
     - Millions: `mn`, `mm`, `m` -> `M`
     - Billions: `bn`, `b` -> `B`
     - Trillions: `tn`, `t` -> `T`
-    - Percent: `%`, `pp` -> `%`
-  - If the unit is "Millions of USD", split it: Currency=`USD`, Magnitude=`M`.
 
 - **Operational Metrics (The Split Rule):**
   - **Energy:** "1.5 GW" -> Value=1.5, Magnitude="G", Measure="W".
   - **Real Estate:** "50k sqft" -> Value=50, Magnitude="k", Measure="sqft".
   - **Commodities:** "$50/oz" -> Value=50, Currency="USD", Measure="oz".
   - **Tech:** "15M users" -> Value=15, Magnitude="M", Measure="users".
+  - **Ratios:** "15.2%" -> Value=15.2, Magnitude="None", Measure="Percent".
 
 - **Measure Standardization (Best Effort):**
   - Prefer standard abbreviations: `sqft` (not sq. ft.), `bbl` (barrels), `t` (tonnes).
@@ -234,12 +246,13 @@ Determine the Chart Type immediately and apply the correct Locking Strategy.
    - **Scenario:** You see a row like `[Value] [Label] [Percentage]` (e.g., "$2.2B Smart-clothing 37%").
    - **RULE:** This `Value` belongs to the **ALIGNED COLUMN** (usually the last year/widest bar) that it visually touches. Do **NOT** assign it to the first year just because it appears high on the Y-axis.
 
-## PROTOCOL 5: SEMANTIC TYPE GUARDRAILS
-You must validate the **Semantic Type** of text before assigning it as a Label.
-- **Axis Labels (Target):** Short, Categorical Nouns (1-4 words). Examples: "Revenue", "Industrial Performance", "Foreign Exchange".
-- **Driver Text (Trap):** Long, Descriptive Sentences (> 6 words, often contain verbs). Examples: "Operational efficiencies outweighing one-time costs."
-- **The Category Trap:** If it's a number, it's a **Metric**. "Strategy" is strictly for qualitative text.
-- **RULE:** If text contains a verb or is > 6 words, it is a **Driver**. Classify it as 'Context', NEVER as a 'Label'.
+## PROTOCOL 5: CLASSIFICATION RULES (Nature of Fact)
+Classify Insights into one of four buckets (NO SENTIMENT ALLOWED):
+1. **Financial:** Hard numbers from the Ledger (P&L, Balance Sheet).
+2. **Operational:** Business metrics (Headcount, Production, Efficiency).
+3. **Strategic:** Management decisions (M&A, Capex, Guidance).
+4. **External:** Market factors (Macro, Regs, Competitors).
+*Refuse to classify subjective "fluff" or spin.*
 
 ## PROTOCOL 6: MATHEMATICAL & VISUAL VALIDATION (The Checksum)
 1. **Visual Proportionality (Bars):** Use **Bar Height** as a checksum.
@@ -255,7 +268,7 @@ You must validate the **Semantic Type** of text before assigning it as a Label.
   - For charts, summarize key data points, trends, comparisons, and overall conclusions, specifying exact numeric values and percentages.
   - Precisely identify components, their significance, and their relevance to the broader financial context.
   - **Disambiguation (CRITICAL):** Do not confuse main series (e.g., "Wholesale Units") with Memo/Reference series (e.g., "JV Wholesales"). Report them as distinct entities.
-- **Clarity & Precision:** Use concise language to ensure clarity and technical accuracy. Do not include subjective or interpretive statements (e.g., "The chart looks good").
+- **Clarity & Precision:** Use **Information-Dense** language. Do not summarize "high-level". Preserve specific nouns, dates, and causal links to ensure high-quality retrieval in Vector Search.
 - **Avoid Visual Descriptors:** Exclude details about colors, shading, fonts, or layout. Focus purely on the data (e.g., instead of "The blue bar is taller," say "Revenue peaked at $50M").
 - **Context:** Relate the image to the broader technical document or topic it supports if context is available.
 
