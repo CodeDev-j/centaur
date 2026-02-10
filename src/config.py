@@ -1,9 +1,56 @@
+"""
+System Configuration: The Central Nervous System
+================================================
+
+1. THE MISSION
+--------------
+To provide a single, immutable source of truth for application configuration.
+This module bridges the gap between environmental secrets (.env), infrastructure
+constants, and dynamic factory logic for LLM instantiation.
+
+2. THE MECHANISM
+----------------
+- **Secret Management:** Loads environment variables via `dotenv` to prevent
+  credential leakage in source control.
+- **Path Abstraction:** Uses `pathlib` to create a rigorous, OS-agnostic map
+  of the project directory structure (`SystemPaths`).
+- **LLM Factory:** Implements the `get_llm` class method to abstract away the
+  complexity of switching between Azure OpenAI and Standard OpenAI providers.
+
+3. THE CONTRACT
+---------------
+- **Validation:** Critical credentials (API Keys) are checked at runtime during
+  LLM initialization, raising immediate errors if missing.
+- **Consistency:** All downstream tools (Layout Analyzer, Visual Extractor)
+  MUST use `SystemConfig.get_llm()` to ensure uniform model parameters (temperature,
+  timeouts, retries) across the pipeline.
+- **Hygiene:** Automatically ensures all required data directories exist on import.
+"""
+
+import logging
 import os
+import warnings
 from pathlib import Path
+from typing import Optional
+
 from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+
+# ------------------------------------------------------------------------------
+# 🔇 WARNING SUPPRESSION
+# ------------------------------------------------------------------------------
+# Suppress Pydantic warnings about "model_" fields in third-party libraries
+# (e.g., Docling, LangChain) that conflict with Pydantic v2 protected namespaces.
+warnings.filterwarnings(
+    "ignore",
+    message=".*Field \"model_.*\" has conflict with protected namespace.*"
+)
 
 # Load environment variables from .env file
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
 
 class SystemConfig:
     """
@@ -11,18 +58,59 @@ class SystemConfig:
     Fetches secrets from .env to prevent hardcoding credentials.
     """
     DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "OPENAI_DEV")
-    
-    # Model Selection
-    VISION_MODEL = os.getenv("VISION_MODEL_NAME", "gpt-4o")
-    REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4o")
-    EMBEDDING_MODEL = "fastembed" # Keeping your explicit definition
-    
-    # Infrastructure (REQUIRED for Docker connection)
+
+    # --- Model Selection ---
+    LAYOUT_MODEL = os.getenv("LAYOUT_MODEL_NAME", "gpt-4.1-mini")
+    VISION_MODEL = os.getenv("VISION_MODEL_NAME", "gpt-4.1-mini")
+    REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4.1")
+    EMBEDDING_MODEL = "fastembed"  # Explicit definition
+
+    # --- Infrastructure (REQUIRED for Docker connection) ---
     POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
     POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
     POSTGRES_DB = os.getenv("POSTGRES_DB", "chiron_ledger")
     POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
     POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+
+    @classmethod
+    def get_llm(
+        cls,
+        model_name: str,
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[int] = None
+    ):
+        """
+        Factory method to get the correct LLM without cluttering class properties.
+        """
+        common_kwargs = {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "request_timeout": timeout,
+            "max_retries": 2,
+        }
+
+        # Check mode dynamically to allow runtime switching if needed
+        if cls.DEPLOYMENT_MODE.upper() == "AZURE":
+            return AzureChatOpenAI(
+                azure_deployment=model_name,
+                api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"),
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+                api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                **common_kwargs
+            )
+        else:
+            # Standard OpenAI (Simplest Path)
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("❌ Missing OPENAI_API_KEY in environment.")
+
+            return ChatOpenAI(
+                model_name=model_name,
+                api_key=api_key,
+                **common_kwargs
+            )
+
 
 class SystemPaths:
     """
@@ -30,12 +118,12 @@ class SystemPaths:
     """
     # Root of the project
     ROOT = Path(__file__).parent.parent
-    
+
     # Data Layer
     DATA = ROOT / "data"
     INPUTS = DATA / "inputs"
     SYSTEM = DATA / "system"
-    
+
     # Storage Layer (Content Truth)
     BLOBS = DATA / "blobs"
     
@@ -43,7 +131,7 @@ class SystemPaths:
     LAYOUTS = BLOBS / "layouts"
     TABLES = BLOBS / "tables"
     DEFINITIONS = BLOBS / "definitions"
-    
+
     # Visual Cache
     SHADOW_CACHE = DATA / "shadow_cache"
 
@@ -53,14 +141,15 @@ class SystemPaths:
         Ensures critical directories exist.
         """
         paths = [
-            cls.DATA, cls.INPUTS, cls.SYSTEM, 
+            cls.DATA, cls.INPUTS, cls.SYSTEM,
             cls.BLOBS, cls.LAYOUTS, cls.TABLES, cls.DEFINITIONS,
             cls.SHADOW_CACHE
         ]
-        
+
         for path in paths:
             if not path.exists():
                 path.mkdir(parents=True, exist_ok=True)
+
 
 # Auto-verify on import
 SystemPaths.verify()
