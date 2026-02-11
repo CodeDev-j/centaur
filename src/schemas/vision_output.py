@@ -245,7 +245,7 @@ class MetricSeries(BaseModel):
         SEARCH PROTOCOL (Check BOTH):
         1. **Visual Link:** Look at the 'series_label' you just extracted. Does it have a marker (*, 1, †)? 
            If yes, scan for the matching footnote.
-        2. **Semantic Link:** Scan all footnotes/notes text on the page, especially the bottom parts. Also  
+        2. **Semantic Link:** Scan all footnotes/notes text on the page, especially the bottom parts.   
            Does a note explicitly name this metric? 
            (e.g. Label='EBITDA', Note='Adjusted EBITDA excludes...')
            If yes, extract that text even if there is no marker on the label.
@@ -345,8 +345,10 @@ class Insight(BaseModel):
     supporting_metrics: List[DataPoint] = Field(
         default_factory=list,
         description="""
-        Specific numbers extracted that validate this argument. 
-        Links the Text Claim to the Financial Proof.
+        ONLY populate if the insight text ITSELF contains an explicit number
+        (e.g., text says 'driven by +15%' → extract 15.0).
+        FORBIDDEN: Do NOT borrow values from the metrics/chart bars to 
+        'prove' a qualitative statement. If uncertain, leave empty [].
         """
     )
     
@@ -392,20 +394,21 @@ class VisionPageResult(BaseModel):
         ...,
         description="""
         The 'Cognitive Scratchpad'. 
-        BEFORE extracting metrics, you MUST analyze the chart structure.
+        BEFORE extracting metrics, you MUST analyze the chart structure in this exact order:
         
-        REQUIRED ANALYSIS (use these steps):
         1. UNITS: Identify the Unit of Measure and Magnitude (Global vs Local).
-           Example: "Values in $ Millions" or "Y-axis shows percentages"
-        2. PERIODICITY: Identify the time frequency (FY, LTM, Quarterly, YTD).
-           Check X-axis labels and titles explicitly.
-        3. CHART TYPE: Identify the structure (Stacked Bar, Waterfall, Dual-Axis, Line).
+        2. PERIODICITY: Identify the time frequency (FY, LTM, Quarterly).
+        3. CHART TYPE: Identify the structure (Stacked, Waterfall, Pie, Valuation).
         4. LEGENDS: Explain how you mapped Colors to Legends.
-           Example: "Blue bars = Revenue, Green bars = EBITDA"
-        5. CONTEXT: Note any Financial Context flags (Adjusted, Pro Forma, LTM).
+        5. CONTEXT: Note any Financial Context flags (Adjusted, Pro Forma).
         6. ANOMALIES: Flag missing data, discontinuities, or annotations.
-        
-        This forces reasoning before action.
+        7. MATH CHECK (CRITICAL): 
+           - Perform a summation/logic check on the visible numbers.
+           - Waterfall: Start + Sum(Deltas) ≈ End.
+           - Stacked / Pie: Sum(Parts) ≈ Total (or 100%).
+           - Valuation Field: Low Value < Mean/Median < High Value.
+           - Table: Check Row/Column Totals if explicit.
+           - If the math fails, RE-READ the labels to find the error.
         """
     )
 

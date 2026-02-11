@@ -66,7 +66,11 @@ class IngestionPipeline:
                 file_name=file_path.name,
                 doc_hash="N/A",
                 status="skipped",
-                error_msg=reason
+                error_msg=reason,
+                total_pages=0,
+                total_chunks=0,
+                processing_time_seconds=0.0,
+                cost_estimate_usd=0.0
             )
 
         # ==============================================================================
@@ -115,11 +119,16 @@ class IngestionPipeline:
             logger.error(f"💥 Pipeline crashed on {file_path.name}: {e}")
             logger.debug(traceback.format_exc())
             # Return Legacy Result for graceful error reporting in Runner
+            # Includes default zeros to prevent Pydantic validation errors
             return IngestionResult(
                 file_name=file_path.name,
                 doc_hash="error",
                 status="failed",
-                error_msg=str(e)
+                error_msg=str(e),
+                total_pages=0,
+                total_chunks=0,
+                processing_time_seconds=(datetime.now() - start_time).total_seconds(),
+                cost_estimate_usd=0.0
             )
 
         # 4. State Update (The Lineage Ledger)

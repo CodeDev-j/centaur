@@ -128,9 +128,10 @@ class SystemPaths:
     BLOBS = DATA / "blobs"
     
     # Specific Artifact Containers
-    LAYOUTS = BLOBS / "layouts"
     TABLES = BLOBS / "tables"
-    DEFINITIONS = BLOBS / "definitions"
+    
+    # [FUTURE PLACEHOLDER] For Legal Parser / Credit Agreement Analysis
+    # DEFINITIONS = BLOBS / "definitions"  <-- Uncomment when Legal Parser is built
 
     # Visual Cache
     SHADOW_CACHE = DATA / "shadow_cache"
@@ -142,7 +143,7 @@ class SystemPaths:
         """
         paths = [
             cls.DATA, cls.INPUTS, cls.SYSTEM,
-            cls.BLOBS, cls.LAYOUTS, cls.TABLES, cls.DEFINITIONS,
+            cls.BLOBS, cls.TABLES,
             cls.SHADOW_CACHE
         ]
 

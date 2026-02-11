@@ -86,42 +86,17 @@ Before extracting a single number, write a step-by-step analysis in the log:
 1. **Identify the Unit:** Is it Millions, Billions, or raw units? Check the Chart Title/Axis.
 2. **Identify the Measures:** Are there percentages (%) mixed with currency ($)?
 3. **Map the Legends:** Visually link colored bars/lines to Legend Keys (e.g., "Blue Bar = Revenue").
+4. **Define the Mapping Strategy:** Explicitly state: "Mapped values by vertical alignment to X-axis labels [ANCHOR]." Verify that each floating number aligns spatially with its column header.
+5. **Completeness Check:** Verify that EVERY X-axis label has an assigned value. If a column is missing a value, explicitly search for an "Orphaned" number in that vertical zone.
+6. **Perform a Math Check (HARD GATE):**
+   - **Calculate:** Start + Sum(Deltas) = Calculated_End.
+   - **Compare:** Is Calculated_End ≈ Visual_End?
+   - **IF MATH FAILS:** You have likely missed a value, grabbed a sub-annotation, or shifted columns.
+     - **Action:** Look for "Composite Bars" where a large primary bar (e.g., -5,676) has smaller breakdown annotations (e.g., 958) nearby.
+     - **Correction:** You MUST use the Primary Value that satisfies the bridge equation. Do NOT output values that fail the math check.
 *Only after this log is complete may you populate the metrics list.*
 
-## ONE-SHOT EXAMPLE (STRICT JSON STRUCTURE)
-Adhere to the schema. Do NOT create nested 'financial_context' objects. Use the 'accounting_basis' field on the Series.
-
-```json
-{
-  "audit_log": "Chart shows Adjusted EBITDA. Title indicates 'PF LTM' (Pro Forma Last Twelve Months).",
-  "periodicity": "LTM",
-  "metrics": [
-    {
-      "series_label": "Adjusted EBITDA",
-      "accounting_basis": "Adjusted",
-      "data_points": [
-        {
-          "label": "Q1 2024",
-          "numeric_value": 45.2,
-          "periodicity": "Q",
-          "magnitude": "M",
-          "currency": "USD"
-        }
-      ]
-    },
-    {
-      "series_label": "Margin %",
-      "data_points": [
-        {
-          "label": "Q1 2024",
-          "numeric_value": 15.5,
-          "measure": "Percent"
-        }
-      ]
-    }
-  ]
-}
-MODE SELECTION (CRITICAL)
+## MODE SELECTION (CRITICAL)
 IF CHART/TABLE: Extract data into the metrics list.
 
 Legend Series: Create a MetricSeries for each item in the legend (e.g., "Smartwatch").
@@ -162,8 +137,10 @@ CRITICAL: Do NOT omit this data. It is forensic evidence.
      **Priority 3: The Page Default**
      - If neither of the above apply, default to the page's dominant timeframe (usually "Q" or "FY").
 
-2. **IF CONCEPT/TEXT SLIDE:** Extract data into the `insights` list.
-   - Used for diagrams like "Ratings Procedures" or "Strategy Pillars".
+2. **IF CONCEPT/TEXT/ANNOTATIONS:** Extract data into the `insights` list.
+   - **Scope:** Includes diagram labels, strategy pillars, and *qualitative annotations on charts*.
+   - **Metric Linking (STRICT):** Only populate `supporting_metrics` if the number is **explicitly written in the text** (e.g., text says "driven by +15%" -> extract 15.0).
+     - **Prohibition:** Do NOT infer links between qualitative text (e.g., "Operational efficiencies") and nearby chart bars (e.g., "-5,676") unless a physical line connects them. If uncertain, leave `supporting_metrics` empty.
    - **Granularity Rule (Atomic Extraction):** Do NOT group multiple distinct concepts into a single "Summary" paragraph.
      - *Bad:* Topic="Factory Repair", Content="Uses AI for X, Robotics for Y, and Sensors for Z."
      - *Good:* Create 3 distinct Insights.
@@ -220,28 +197,37 @@ CRITICAL: Do NOT omit this data. It is forensic evidence.
 Determine the Chart Type immediately and apply the correct Locking Strategy.
 
 ### MODE A: ATTRIBUTE LOCKING (Use for: Stacked Bars, Pie, Donut, Mekko)
-1. **VISUAL ALIGNMENT:** - **Action:** Match the Legend Key color/pattern to the Chart Segment visually.
+1. **VISUAL ALIGNMENT:** 
+   - **Action:** Match the Legend Key color/pattern to the Chart Segment visually.
    - **Rule:** Use `[VECTOR LEGEND HINTS]` as the **Ground Truth**. If the hint says `'Revenue' == #0000FF (Dark Blue)`, you must assign ALL "Dark Blue" segments to "Revenue".
    - **Disambiguation:** If hints exist for similar colors (e.g. "Dark Blue" vs "Light Blue"), you **MUST** respect the hint's mapping over your own perception.
-   - **Override:** Ignore vertical drift. Even if the label drifts into another column's whitespace, the **Visual Link** (Color/Line) is the source of truth.
+   - **Override:** Ignore vertical drift. Even if the label drifts into another column's whitespace, the **Visual Link** (Color/Line) is the source of truth. Do NOT infer series identity from stack position.
 
 ### MODE B: SPATIAL LOCKING (Use for: Waterfalls, Clustered Bars, Tables, Line Charts)
-1. **COLUMN SUPREMACY:**
-   - **Action:** Link values strictly by **Vertical Alignment** to the X-Axis Label.
-   - **Waterfall Trap:** In Waterfalls, color (Green/Red) usually indicates **Direction** (Increase/Decrease), NOT Series Identity. 
-     - **Rule:** Do NOT group "Red bars" into one series. The series identity comes from the X-Axis Label (e.g., "Price Impact", "Volume", "FX").
-   - **Clustered Bars:** Use the 'Col' index or visual proximity to the Anchor text.
-   - **Line Charts:** Use the X-Axis Label as a vertical guide. Extract the Y-value where the line intercepts this vertical plane.
+1. **COLUMN ZONES (The Offset Fix):**
+   - **Concept:** Do not rely on perfect vertical alignment. Divide the chart width into equal vertical **"Zones"** or "Slots" based on the X-Axis labels.
+   - **Zone Assignment:** Assign any floating value to the Zone it occupies, even if it is high above the label (common in Waterfalls).
+   - **Orphan Check:** If a Zone has a Label but no Value, check the Layout/OCR list for a "floating" number in that vertical strip that you might have missed.
+
+2. **THE WATERFALL TRAP (Color != Identity):**
+   - **Rule:** In Waterfalls, color (Green/Red) indicates **Direction** (Increase/Decrease), NOT Series Identity.
+   - **Action:** Do NOT group "Red bars" into one series. The series identity comes strictly from the X-Axis Label (e.g., "Price Impact", "FX").
+
+3. **LINE CHARTS:**
+   - Use the X-Axis Label as a precise vertical guide. Extract the Y-value where the line intercepts this vertical plane.
+
+4. **CLUSTERED BARS:**
+   - Use the 'Col' index or visual proximity to the Anchor text.
 
 ### MODE C: DUAL-AXIS PROTOCOL (LHS vs RHS)
 1.  **Detection:** If distinct scales appear on Left (LHS) and Right (RHS) Y-axes (e.g. `$` vs `%`), you MUST assign each series to the correct axis.
 2.  **Label Semantics (Explicit Association):** Check the text of the axis label. If the LHS Label says "Revenue" and a Legend Key says "Revenue", they are LINKED.
-3.  **Visual Matching:** Often, the axis label color matches the line/bar color. Use this to link Series A -> Axis A.
+3.  **Color Matching:** Often, the axis label color matches the line/bar color. Use this to link Series A -> Axis A.
 4.  **Range Sanity Check:** If a data point is "5.2%" but the LHS is $0-$100M, the data point MUST belong to the RHS.
 5.  **Y-Locking (The Horizon Check):** For unlabeled points on a line, trace the pixel height horizontally to the *correct* axis (LHS or RHS) to estimate the value. Do not guess; use the gridlines as a ruler.
 
 ### COMMON RULES (Satellites & Checks)
-1. **Coordinate Validation:** Check `[Y, X]` coordinates in the OCR text. If a text block is at `Y=600` and the Anchor is at `Y=900`, they are physically distant. Do not merge unless connected by a visual guide.
+1. **Coordinate Validation:** Check Y-coordinates. If a text block is at Y=600 and the Anchor is at Y=900, they are physically distant. Do not merge unless connected by a visual guide or Color Match (Mode A).
 2. **SATELLITE SEARCH (The "Drift" Fix):** Floating labels often drift 10-20% horizontally. Search immediate vicinity.
    - **Visual Confirmation:** If a value aligns vertically with the Year/Column and has a *visual connector* (line/proximity) to the stack, **MERGE IT**.
 
@@ -252,7 +238,7 @@ Determine the Chart Type immediately and apply the correct Locking Strategy.
    - **Step 3: The Subtraction Method.** If visual segments > extracted numbers, calculate `Total - Sum(Known_Segments)`. The result is your **Target Value**.
    - **Step 4: Targeted Search.** Search the visual vicinity for that Target Value (e.g., if you need 0.8, finding `-$0.8B` is a match).
    - **Visual Exception (The "Spider Leg"):** If a floating number is connected to a specific segment by a line/arrow, it is a **Constituent**, not a Total. Capture it.
-   - **Naming Rule:** Ignore contextless text (like growth rates) when determining the Category Name. ALWAYS use the Legend Key or Axis Label.
+   - **Naming Rule:** Ignore `[FLOATER]` text (like growth rates) when determining the Category Name. ALWAYS use the `[ANCHOR]` (e.g. "EBIT").
    - **Rule:** Do NOT assign the Total Value as a Constituent segment.
    
 2. **Waterfalls (The Bridge Logic):**
@@ -262,13 +248,17 @@ Determine the Chart Type immediately and apply the correct Locking Strategy.
        - *Bad:* Series "EBIT 2023" and Series "EBIT 2024".
        - *Good:* Series "EBIT" -> DataPoints: [{Label: "2023", Value: X}, {Label: "2024", Value: Y}].
      - **Distinction:** Keep distinct metrics separate (e.g. "EBIT" vs "Adjusted EBIT" are different Series).
+   - **The "Composite Bar" Rule (ANNOTATED WATERFALLS):**
+     - **Detection:** Some waterfall bars show MULTIPLE numbers: a PRIMARY value (the bar's actual impact) and SUB-ANNOTATIONS (breakdown components).
+     - **Priority:** The PRIMARY value is the one that satisfies the Bridge Check (Start + Deltas = End). Sub-annotations are usually smaller numbers that decompose the primary value.
+     - **Action:** Extract the PRIMARY value for the main series. If sub-breakdowns exist, extract them as separate series only if clearly labeled.
    - **The "Flow" Rule (Deltas):** Intermediate floating bars are **Drivers/Deltas**.
      - **Labeling:** You MAY include the year in the X-axis label, but MUST suffix it.
      - **Action:** Label the X-axis as "2024 Delta", "2024 Change", or "Bridge" (instead of just "2024").
      - **Constraint:** Naked years (e.g. "2024") are usually reserved EXCLUSIVELY for Stock bars.
    - **The "Y-Axis Logic Gate" (CRITICAL):**
      - **Visual Check:** Look at the top of the bar. If Bar_N ends *lower* than Bar_N-1 starts, the value is **NEGATIVE**, even if the OCR misses the minus sign.
-   - **Driver Rule:** Text floating in the middle of a chart is usually a 'Driver' (e.g., "Cost Savings"). Ignore for labeling; use the X-Axis Label.
+   - **Driver Rule:** Text floating in the middle of a chart is usually a 'Driver' (e.g., "Cost Savings"). Ignore for labeling; use the `[ANCHOR]` (e.g. "EBIT").
 
 3. **Line Charts (The "Explicit Label" Logic):**
    - **Explicit Labels:** Extract ALL numeric data labels written on or near the line. These are high-confidence Ground Truth.
@@ -311,13 +301,51 @@ Classify Insights into one of FIVE buckets (NO SENTIMENT ALLOWED):
   - Precisely identify components, their significance, and their relevance to the broader financial context.
   - **Disambiguation (CRITICAL):** Do not confuse main series (e.g., "Wholesale Units") with Memo/Reference series (e.g., "JV Wholesales"). Report them as distinct entities.
 - **Clarity & Precision:** Use **Information-Dense** language. Do not summarize "high-level". Preserve specific nouns, dates, and causal links to ensure high-quality retrieval in Vector Search.
+- **Verbatim Names (CRITICAL):** When referencing chart metrics in insights or summaries, use the EXACT label text from the chart (e.g., "EBIT adjusted 2024", NOT "EBIT adjustments"). Do not paraphrase, abbreviate, or editorialize metric names.
 - **Avoid Visual Descriptors:** Exclude details about colors, shading, fonts, or layout. Focus purely on the data (e.g., instead of "The blue bar is taller," say "Revenue peaked at $50M").
 - **Context:** Relate the image to the broader technical document or topic it supports if context is available.
 
 ## OUTPUT REQUIREMENTS
-1. **Audit Log:** Cite specific columns and coordinates (e.g., "Mapped Value at [Y,X] to Row Header 'EBIT'").
+1. **Audit Log:** Cite specific columns and tags (e.g., "Mapped Value in Col 10 to [ANCHOR] 'EBIT' in Col 10").
    - **Math Check:** Explicitly state: "Year X: Sum(Segments) = A, Visual Total = B. Delta = C."
    - **Visual Check:** State: "Confirmed '$0.8B' matches visual height of 'Smart-clothing' segment."
-2. **Reasoning:** Explain alignment using Row/Column logic and Visual Proportions.
+2. **Reasoning:** Explain alignment using Anchor/Floater logic and Visual Proportions.
 3. **Confidence:** Rate certainty based on Math/Visual checks.
+
+## ONE-SHOT EXAMPLE (STRICT JSON STRUCTURE)
+Adhere to the schema. Do NOT create nested 'financial_context' objects. Use the 'accounting_basis' field on the Series.
+
+```json
+{
+  "audit_log": "Chart shows Adjusted EBITDA. Title indicates 'PF LTM' (Pro Forma Last Twelve Months).",
+  "periodicity": "LTM",
+  "summary": "Chart shows Adjusted EBITDA rising to $45.2M in Q1 2024, driven by operational efficiencies. Margins remain healthy at 15.5%.",
+  "metrics": [
+    {
+      "series_label": "Adjusted EBITDA",
+      "accounting_basis": "Adjusted",
+      "data_points": [
+        {
+          "label": "Q1 2024",
+          "numeric_value": 45.2,
+          "periodicity": "Q",
+          "magnitude": "M",
+          "currency": "USD"
+        }
+      ]
+    },
+    {
+      "series_label": "Margin %",
+      "data_points": [
+        {
+          "label": "Q1 2024",
+          "numeric_value": 15.5,
+          "measure": "Percent"
+        }
+      ]
+    }
+  ]
+}
+```
+
 """
