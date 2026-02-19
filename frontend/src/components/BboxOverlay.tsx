@@ -12,6 +12,7 @@ interface BboxOverlayProps {
 /**
  * Absolutely-positioned highlight div overlaid on a PDF page.
  * Scales normalized 0-1 coordinates to actual container dimensions.
+ * Uses mix-blend-mode: multiply so text underneath stays legible.
  */
 export default function BboxOverlay({
   citation,
@@ -22,8 +23,6 @@ export default function BboxOverlay({
   if (!citation.bbox) return null;
 
   const { x, y, width, height } = citation.bbox;
-
-  // Small uniform padding in normalized coords for visual breathing room
   const pad = 0.003;
 
   const style: React.CSSProperties = {

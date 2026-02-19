@@ -5,9 +5,10 @@ Each node reads from AgentState and writes retrieval results back.
 """
 
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from langsmith import traceable
+from qdrant_client import models
 
 from src.schemas.state import AgentState
 from src.retrieval.qdrant import RetrievalPipeline
@@ -30,6 +31,20 @@ def set_analytics_driver(driver):
     _analytics_driver = driver
 
 
+def _build_doc_filter(doc_hash: Optional[str]) -> Optional[models.Filter]:
+    """Builds Qdrant filter for doc_hash if provided."""
+    if not doc_hash:
+        return None
+    return models.Filter(
+        must=[
+            models.FieldCondition(
+                key="doc_hash",
+                match=models.MatchValue(value=doc_hash),
+            )
+        ]
+    )
+
+
 @traceable(name="Retrieve Qualitative", run_type="chain")
 async def retrieve_qualitative(state: AgentState) -> dict:
     """Qdrant hybrid search for narrative/qualitative queries."""
@@ -37,6 +52,7 @@ async def retrieve_qualitative(state: AgentState) -> dict:
         query=state["query"],
         locale=state.get("query_locale", "en"),
         top_k=10,
+        filters=_build_doc_filter(state.get("doc_filter")),
     )
 
     context_str, sidecar_map = build_context_with_citations(result.chunks)
@@ -65,6 +81,7 @@ async def retrieve_quantitative(state: AgentState) -> dict:
         query=state["query"],
         locale=state.get("query_locale", "en"),
         top_k=5,
+        filters=_build_doc_filter(state.get("doc_filter")),
     )
 
     context_str, sidecar_map = build_context_with_citations(result.chunks)
@@ -88,6 +105,7 @@ async def retrieve_hybrid(state: AgentState) -> dict:
         query=state["query"],
         locale=state.get("query_locale", "en"),
         top_k=10,
+        filters=_build_doc_filter(state.get("doc_filter")),
     )
 
     sql_result = await generate_and_execute_sql(

@@ -81,6 +81,7 @@ class VectorDriver:
         self.sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
 
         self._ensure_collection()
+        self._ensure_payload_indices()
         logger.info(
             f"Search Truth initialized. "
             f"Collection: {self.COLLECTION_NAME} | "
@@ -111,6 +112,26 @@ class VectorDriver:
                 )
             },
         )
+
+    def _ensure_payload_indices(self):
+        """
+        Creates payload indices for efficient scroll/count filtering.
+        Idempotent — Qdrant ignores if indices already exist.
+        """
+        index_specs = [
+            ("doc_hash", models.PayloadSchemaType.KEYWORD),
+            ("page_number", models.PayloadSchemaType.INTEGER),
+            ("item_type", models.PayloadSchemaType.KEYWORD),
+        ]
+        for field, schema in index_specs:
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.COLLECTION_NAME,
+                    field_name=field,
+                    field_schema=schema,
+                )
+            except Exception:
+                pass  # Index already exists
 
     @traceable(name="Embed Texts (Cohere)", run_type="tool")
     async def _embed_texts(
@@ -273,3 +294,67 @@ class VectorDriver:
             ),
         )
         logger.info(f"Deleted vectors for doc_hash: {doc_hash[:8]}...")
+
+    def scroll_by_page(self, doc_hash: str, page_number: int) -> list:
+        """
+        Returns all Qdrant points for a specific document page.
+        Paginates via next_page_offset to never silently drop chunks.
+        Full payload is returned (caller strips value_bboxes for API response).
+        """
+        all_points = []
+        offset = None
+        page_filter = models.Filter(must=[
+            models.FieldCondition(
+                key="doc_hash",
+                match=models.MatchValue(value=doc_hash),
+            ),
+            models.FieldCondition(
+                key="page_number",
+                match=models.MatchValue(value=page_number),
+            ),
+        ])
+
+        while True:
+            points, next_offset = self.client.scroll(
+                collection_name=self.COLLECTION_NAME,
+                scroll_filter=page_filter,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            all_points.extend(points)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return all_points
+
+    def count_by_doc(self, doc_hash: str) -> Dict[str, int]:
+        """
+        Count chunks grouped by item_type for a document.
+        Uses Qdrant's Count API with indexed filters — sub-1ms per type.
+        """
+        item_types = [
+            "financial_table", "chart_table", "visual", "narrative", "header"
+        ]
+        doc_condition = models.FieldCondition(
+            key="doc_hash",
+            match=models.MatchValue(value=doc_hash),
+        )
+        counts = {}
+        for item_type in item_types:
+            result = self.client.count(
+                collection_name=self.COLLECTION_NAME,
+                count_filter=models.Filter(must=[
+                    doc_condition,
+                    models.FieldCondition(
+                        key="item_type",
+                        match=models.MatchValue(value=item_type),
+                    ),
+                ]),
+                exact=True,
+            )
+            if result.count > 0:
+                counts[item_type] = result.count
+        return counts

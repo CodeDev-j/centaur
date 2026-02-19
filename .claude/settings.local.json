@@ -5,7 +5,12 @@
       "Bash(python -c:*)",
       "Bash(where:*)",
       "Bash(ls:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(conda run:*)",
+      "Bash(npm install:*)",
+      "Bash(npx next build:*)",
+      "Bash(git add:*)"
     ]
   }
 }

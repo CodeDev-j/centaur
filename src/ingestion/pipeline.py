@@ -115,7 +115,10 @@ class IngestionPipeline:
             # 3. Indexing (The Search Truth)
             # ------------------------------------------------------------------
             # 3a. Vector index: flatten items → chunks → Qdrant (dense + sparse)
-            logger.info("Generating embeddings & indexing to Qdrant...")
+            # Clean up any existing chunks first (prevents duplicates on re-ingestion)
+            logger.info("Cleaning old vectors & indexing to Qdrant...")
+            await self.indexer.delete_by_doc_hash(doc_hash)
+
             chunks = flatten_document(doc)
             if chunks:
                 await self.indexer.index(chunks)

@@ -1,8 +1,11 @@
 """
-Document Routes: Serve document pages and region overlays for the viewer.
+Document Routes: Serve document pages, region overlays, and chunk inspection.
 
-GET /api/v1/documents/{hash}/page/{n}/image    — Rendered page image (PyMuPDF)
-GET /api/v1/documents/{hash}/page/{n}/regions  — Bbox overlays for highlighting
+GET /api/v1/documents/{hash}/pdf                    — Raw PDF for react-pdf
+GET /api/v1/documents/{hash}/page/{n}/image         — Rendered page image (PyMuPDF)
+GET /api/v1/documents/{hash}/page/{n}/regions       — Bbox overlays (stub)
+GET /api/v1/documents/{hash}/page/{n}/chunks        — All chunks for inspection
+GET /api/v1/documents/{hash}/stats                  — Document-level chunk counts
 """
 
 import io
@@ -13,13 +16,39 @@ from typing import List
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from src.api.schemas import RegionOverlay
+from src.api.schemas import (
+    ChunkDetail,
+    DocStatsResponse,
+    PageChunksResponse,
+    RegionOverlay,
+)
 from src.config import SystemPaths
 from src.storage.db_driver import ledger_db, DocumentLedger
+from src.storage.vector_driver import VectorDriver
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
 
+# ---------------------------------------------------------------------------
+# Vector driver wiring (set during app startup in main.py)
+# ---------------------------------------------------------------------------
+_vector_driver: VectorDriver | None = None
+
+
+def set_vector_driver(driver: VectorDriver) -> None:
+    global _vector_driver
+    _vector_driver = driver
+
+
+def _get_vector_driver() -> VectorDriver:
+    if _vector_driver is None:
+        raise HTTPException(status_code=503, detail="Vector driver not initialized")
+    return _vector_driver
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _find_pdf_path(doc_hash: str) -> Path:
     """Finds the PDF file path from the ledger."""
@@ -36,6 +65,70 @@ def _find_pdf_path(doc_hash: str) -> Path:
             raise HTTPException(status_code=404, detail="PDF file not found on disk")
         return pdf_path
 
+
+# Chunk type sort priority: tables first, then charts, visuals, narrative, headers
+_TYPE_PRIORITY = {
+    "financial_table": 0,
+    "chart_table": 1,
+    "visual": 2,
+    "narrative": 3,
+    "header": 4,
+}
+
+# Core payload fields that are NOT type-specific metadata
+_CORE_FIELDS = {
+    "doc_id", "doc_hash", "source_file", "page_number",
+    "item_id", "item_type", "chunk_text", "chunk_role",
+    "bbox_x", "bbox_y", "bbox_width", "bbox_height",
+    "value_bboxes",
+}
+
+
+def _point_to_chunk(point) -> ChunkDetail:
+    """Converts a Qdrant point to a ChunkDetail for the API response."""
+    p = point.payload
+
+    # Extract bbox if present
+    bbox = None
+    if all(k in p for k in ("bbox_x", "bbox_y", "bbox_width", "bbox_height")):
+        bbox = {
+            "x": float(p["bbox_x"]),
+            "y": float(p["bbox_y"]),
+            "width": float(p["bbox_width"]),
+            "height": float(p["bbox_height"]),
+        }
+
+    # Count value_bboxes entries, then strip from metadata
+    vb = p.get("value_bboxes")
+    vb_count = len(vb) if isinstance(vb, dict) else 0
+
+    # Everything not in _CORE_FIELDS is type-specific metadata
+    metadata = {k: v for k, v in p.items() if k not in _CORE_FIELDS}
+
+    return ChunkDetail(
+        chunk_id=str(point.id),
+        item_id=p.get("item_id", ""),
+        item_type=p.get("item_type", "unknown"),
+        chunk_text=p.get("chunk_text", ""),
+        chunk_role=p.get("chunk_role"),
+        bbox=bbox,
+        metadata=metadata,
+        value_bboxes_count=vb_count,
+    )
+
+
+def _chunk_sort_key(chunk: ChunkDetail) -> tuple:
+    """Sort: type priority, then summary before series, then by series_label."""
+    type_pri = _TYPE_PRIORITY.get(chunk.item_type, 99)
+    role = chunk.chunk_role or ""
+    role_pri = 0 if role == "summary" else 1
+    label = chunk.metadata.get("series_label", "")
+    return (type_pri, role_pri, label)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 @router.get("/{doc_hash}/pdf")
 async def get_pdf(doc_hash: str):
@@ -87,9 +180,47 @@ async def get_page_image(doc_hash: str, page_number: int):
 async def get_page_regions(doc_hash: str, page_number: int):
     """
     Returns bounding box overlays for a given page.
-    Reads from the shadow cache or reconstructs from layout data.
     Currently returns empty — will be populated when layout cache is implemented.
     """
-    # TODO: Read from layout cache when available
-    # For now, return empty list. The frontend can still display the page.
     return []
+
+
+@router.get(
+    "/{doc_hash}/page/{page_number}/chunks",
+    response_model=PageChunksResponse,
+)
+async def get_page_chunks(doc_hash: str, page_number: int):
+    """
+    Returns all indexed chunks for a specific page, sorted by type priority.
+    Uses Qdrant scroll with indexed payload filters — no embedding needed.
+    value_bboxes are stripped from the response (only count is included).
+    """
+    vd = _get_vector_driver()
+    points = vd.scroll_by_page(doc_hash, page_number)
+
+    chunks = [_point_to_chunk(pt) for pt in points]
+    chunks.sort(key=_chunk_sort_key)
+
+    return PageChunksResponse(
+        doc_hash=doc_hash,
+        page_number=page_number,
+        total_chunks=len(chunks),
+        chunks=chunks,
+    )
+
+
+@router.get("/{doc_hash}/stats", response_model=DocStatsResponse)
+async def get_doc_stats(doc_hash: str):
+    """
+    Returns document-level chunk counts grouped by item_type.
+    Uses Qdrant's Count API with indexed filters — sub-1ms per type.
+    """
+    vd = _get_vector_driver()
+    counts = vd.count_by_doc(doc_hash)
+    total = sum(counts.values())
+
+    return DocStatsResponse(
+        doc_hash=doc_hash,
+        total_chunks=total,
+        by_type=counts,
+    )

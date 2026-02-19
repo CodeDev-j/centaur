@@ -105,10 +105,14 @@ async def _run_ingestion_background(file_path: Path, doc_hash: str):
 
 @router.post("/ingest")
 @traceable(name="Ingest Endpoint", run_type="chain")
-async def ingest(file: UploadFile = File(...)):
+async def ingest(file: UploadFile = File(...), force: bool = False):
     """
     Upload a file for ingestion. Returns 202 immediately.
     Subscribe to GET /ingest/{doc_hash}/status for SSE progress updates.
+
+    If the file has already been successfully ingested (same content hash),
+    returns 200 with the existing doc_hash — no re-processing.
+    Pass force=true to re-ingest (e.g., after pipeline/prompt changes).
     """
     if _pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
@@ -121,10 +125,31 @@ async def ingest(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
-    # 2. Compute doc_hash for the ledger entry
+    # 2. Compute doc_hash from file content (SHA256)
     doc_hash = hashlib.sha256(dest.read_bytes()).hexdigest()
 
-    # 3. Create ledger entry with status="processing" so it appears in the list
+    # 3. Skip if already successfully ingested (unless force=True)
+    if not force and ledger_db:
+        try:
+            with ledger_db.session() as session:
+                existing = session.query(DocumentLedger).filter_by(doc_hash=doc_hash).first()
+                if existing and existing.status == "completed":
+                    logger.info(
+                        f"Skipping ingestion for {file.filename} — "
+                        f"already completed (hash: {doc_hash[:12]}...)"
+                    )
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "status": "already_ingested",
+                            "doc_hash": doc_hash,
+                            "filename": file.filename,
+                        },
+                    )
+        except Exception as db_err:
+            logger.warning(f"Ledger check failed, proceeding with ingestion: {db_err}")
+
+    # 4. Create/update ledger entry with status="processing"
     if ledger_db:
         try:
             with ledger_db.session() as session:
@@ -140,7 +165,7 @@ async def ingest(file: UploadFile = File(...)):
         except Exception as db_err:
             logger.warning(f"Ledger pre-registration failed: {db_err}")
 
-    # 4. Create tracker and launch background task
+    # 5. Create tracker and launch background task
     _trackers[doc_hash] = _IngestionTracker()
     asyncio.create_task(_run_ingestion_background(dest, doc_hash))
 

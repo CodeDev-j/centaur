@@ -36,6 +36,9 @@ class AgentState(TypedDict):
     sidecar_map: Dict[int, RetrievedChunk]
     context_str: str
 
+    # --- Filters ---
+    doc_filter: Optional[str]          # doc_hash to scope retrieval (None = all)
+
     # --- Generation Outputs ---
     final_answer: str
     citations: List[Citation]

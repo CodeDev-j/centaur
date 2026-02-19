@@ -35,8 +35,10 @@ async def startup():
     """Initialize the LangGraph workflow and wire into routes."""
     from src.workflows.graph import build_graph
     from src.ingestion.pipeline import IngestionPipeline
+    from src.storage.vector_driver import VectorDriver
     from src.api.routes.chat import set_graph
     from src.api.routes.ingestion import set_pipeline
+    from src.api.routes.documents import set_vector_driver
 
     logger.info("Initializing Centaur API...")
 
@@ -47,6 +49,10 @@ async def startup():
     # Initialize ingestion pipeline for upload endpoint
     pipeline = IngestionPipeline()
     set_pipeline(pipeline)
+
+    # Initialize vector driver for chunk inspection endpoints
+    vector_driver = VectorDriver()
+    set_vector_driver(vector_driver)
 
     logger.info("Centaur API ready.")
 

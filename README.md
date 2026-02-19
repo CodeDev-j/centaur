@@ -27,45 +27,45 @@ Most RAG systems treat documents as flat text. Financial documents aren't flat t
     ┌─────────────────────────────────────────────────────────────────┐
     │                                                                 │
     │   INGESTION (Write Path)                                        │
-    │   ┌──────────┐    ┌──────────────┐    ┌────────────────────┐   │
+    │   ┌───────────┐    ┌──────────────┐    ┌────────────────────┐   │
     │   │  Smart    │───>│  Dual-Helix  │───>│  Unified Document  │   │
     │   │  Router   │    │  Parsers     │    │  (Typed Stream)    │   │
-    │   └──────────┘    │              │    └────────┬───────────┘   │
+    │   └───────────┘    │              │    └────────┬───────────┘   │
     │                    │  Helix A:    │             │               │
-    │                    │  PDF/Visual  │        ┌────┴────┐         │
-    │                    │  (Docling +  │        │         │         │
-    │                    │   VLM x2)    │        ▼         ▼         │
-    │                    │              │   ┌────────┐ ┌────────┐    │
-    │                    │  Helix B:    │   │ Qdrant │ │Postgres│    │
-    │                    │  Native      │   │ Hybrid │ │ Metric │    │
-    │                    │  (Excel)     │   │ Index  │ │ Facts  │    │
-    │                    └──────────────┘   └────────┘ └────────┘    │
-    │                                           │           │        │
-    │   RETRIEVAL (Read Path)                   │           │        │
-    │   ┌──────────┐    ┌──────────────┐   ┌────┴───────────┴───┐   │
-    │   │  Query   │───>│  Term        │──>│  Hybrid Search     │   │
-    │   │  Router  │    │  Injector    │   │  (Dense + BM25)    │   │
-    │   │  (LLM)   │    │  (Multilin.) │   │  + Voyage Rerank   │   │
-    │   └──────────┘    └──────────────┘   │  + Text-to-SQL     │   │
-    │        │                              └─────────┬─────────┘   │
-    │        │                                        │              │
-    │   GENERATION                                    │              │
-    │   ┌──────────────────────────────────────┐     │              │
-    │   │  GPT-4.1 Structured Output            │<────┘              │
-    │   │  + Citation Sidecar (fact-based dedup)│                    │
-    │   │  + Fine-Grained BBox Resolution       │                    │
-    │   └──────────────┬───────────────────────┘                    │
-    │                  │                                             │
-    └──────────────────┼─────────────────────────────────────────────┘
+    │                    │  PDF/Visual  │        ┌────┴────┐          │
+    │                    │  (Docling +  │        │         │          │
+    │                    │   VLM x2)    │        ▼         ▼          │
+    │                    │              │   ┌────────┐ ┌────────┐     │
+    │                    │  Helix B:    │   │ Qdrant │ │Postgres│     │
+    │                    │  Native      │   │ Hybrid │ │ Metric │     │
+    │                    │  (Excel)     │   │ Index  │ │ Facts  │     │
+    │                    └──────────────┘   └────────┘ └────────┘     │
+    │                                           │           │         │
+    │   RETRIEVAL (Read Path)                   │           │         │
+    │   ┌──────────┐    ┌──────────────┐   ┌────┴───────────┴───┐     │
+    │   │  Query   │───>│  Term        │──>│  Hybrid Search     │     │
+    │   │  Router  │    │  Injector    │   │  (Dense + BM25)    │     │
+    │   │  (LLM)   │    │  (Multilin.) │   │  + Voyage Rerank   │     │
+    │   └──────────┘    └──────────────┘   │  + Text-to-SQL     │     │
+    │        │                             └──────────┬─────────┘     │
+    │        │                                        │               │
+    │   GENERATION                                    │               │
+    │   ┌───────────────────────────────────────┐     │               │
+    │   │  GPT-4.1 Structured Output            │<────┘               │
+    │   │  + Citation Sidecar (fact-based dedup)│                     │
+    │   │  + Fine-Grained BBox Resolution       │                     │
+    │   └──────────────┬────────────────────────┘                     │
+    │                  │                                              │
+    └──────────────────┼──────────────────────────────────────────────┘
                        │
                        ▼
     ┌─────────────────────────────────────────────────────────────────┐
-    │   FastAPI  ──>  SSE Stream  ──>  Next.js UI                    │
-    │                                  ┌─────┬────────┬──────┐       │
-    │                                  │Docs │ PDF    │ Chat │       │
-    │                                  │List │ Viewer │Panel │       │
-    │                                  │     │ +BBox  │ +Cite│       │
-    │                                  └─────┴────────┴──────┘       │
+    │   FastAPI  ──>  SSE Stream  ──>  Next.js UI                     │
+    │                                  ┌─────┬────────┬──────┐        │
+    │                                  │Docs │ PDF    │ Chat │        │
+    │                                  │List │ Viewer │Panel │        │
+    │                                  │     │ +BBox  │ +Cite│        │
+    │                                  └─────┴────────┴──────┘        │
     └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -490,7 +490,7 @@ All extracted insights are classified into five categories:
 
 1. **No Mental Math.** The LLM never performs arithmetic. All calculations use `resolved_value` (pre-computed in Python) or the calculator tool.
 
-2. **Mandatory Citations via Structured Output.** The LLM returns `{segments: [{text, source_ids}]}` — it never writes `[N]` markers in prose. Python assembles, deduplicates, and formats all citation markers deterministically. Every factual claim resolves to a verifiable source location with a fine-grained bounding box.
+2. **Mandatory Citations.** Every generated factual claim must carry a `[N]` marker that resolves to a verifiable source location.
 
 3. **Token Firewall.** Headers, footers, and decorative artifacts are stripped before embedding to prevent noise in the vector index.
 

@@ -250,35 +250,36 @@ def assemble_cited_answer(
         valid_sids = [s for s in seg.get("source_ids", []) if s in sidecar_map]
         resolved_segments.append((text, valid_sids[0] if valid_sids else None))
 
-    # 2. Assign badge numbers to unique source_ids (first-appearance order)
-    source_to_badge: Dict[int, int] = {}
-    badge_order: List[int] = []  # source_ids in badge order
-    for _text, sid in resolved_segments:
-        if sid is not None and sid not in source_to_badge:
-            badge_order.append(sid)
-            source_to_badge[sid] = len(badge_order)  # 1-indexed
-
-    # 3. Collect citing texts per badge (only segments where that badge appears)
-    source_citing_texts: Dict[int, List[str]] = {}
+    # 2. Assign unique badge number per cited segment (no cross-segment dedup).
+    #    Each badge resolves its own fine-grained bbox from its own citing text,
+    #    so "$16,836" highlights one cell while "$13,454" highlights another —
+    #    even when both come from the same source chunk.
+    badge_counter = 0
+    segment_badges: List[Tuple[str, Optional[int]]] = []  # (text, badge_num | None)
+    badge_info: List[Tuple[int, str]] = []  # (source_id, citing_text) per badge
     for text, sid in resolved_segments:
         if sid is not None:
-            source_citing_texts.setdefault(sid, []).append(text)
+            badge_counter += 1
+            segment_badges.append((text, badge_counter))
+            badge_info.append((sid, text))
+        else:
+            segment_badges.append((text, None))
 
-    # 4. Build answer text with [N] markers
+    # 3. Build answer text with [N] markers
     parts = []
-    for text, sid in resolved_segments:
-        if sid is not None and sid in source_to_badge:
-            parts.append(f"{text} [{source_to_badge[sid]}]")
+    for text, badge in segment_badges:
+        if badge is not None:
+            parts.append(f"{text} [{badge}]")
         else:
             parts.append(text)
     answer = " ".join(parts)
 
-    # 5. Build Citation objects with fact-scoped bboxes
+    # 4. Build Citation objects — each badge gets its own bbox resolved from
+    #    only its own segment text for maximum highlighting precision.
     citations = []
-    for source_id in badge_order:
+    for source_id, citing_text in badge_info:
         chunk = sidecar_map[source_id]
-        citing_texts = source_citing_texts.get(source_id, [])
-        bbox = _resolve_fine_bbox(chunk, citing_texts)
+        bbox = _resolve_fine_bbox(chunk, [citing_text])
 
         citations.append(Citation(
             source_file=chunk.source_file,
@@ -290,7 +291,6 @@ def assemble_cited_answer(
 
     logger.info(
         f"Assembled answer: {len(segments)} segments → "
-        f"{len(citations)} citations (fact-based dedup, "
-        f"{sum(1 for _, s in resolved_segments if s is not None)} cited segments)"
+        f"{len(citations)} badges ({badge_counter} cited segments)"
     )
     return answer, citations

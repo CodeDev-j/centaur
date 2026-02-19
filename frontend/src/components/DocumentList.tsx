@@ -8,19 +8,20 @@ import {
   getIngestStatusUrl,
   DocumentSummary,
 } from "@/lib/api";
+import { useDocStore } from "@/stores/useDocStore";
+import { useViewerStore } from "@/stores/useViewerStore";
+import { useInspectStore } from "@/stores/useInspectStore";
+import { useChatStore } from "@/stores/useChatStore";
 
-interface DocumentListProps {
-  selectedDocHash: string | null;
-  onSelectDocument: (hash: string) => void;
-}
+export default function DocumentList() {
+  const documents = useDocStore((s) => s.documents);
+  const selectedDocHash = useDocStore((s) => s.selectedDocHash);
+  const isUploading = useDocStore((s) => s.isUploading);
+  const setDocuments = useDocStore((s) => s.setDocuments);
+  const selectDocument = useDocStore((s) => s.selectDocument);
+  const setIsUploading = useDocStore((s) => s.setIsUploading);
 
-export default function DocumentList({
-  selectedDocHash,
-  onSelectDocument,
-}: DocumentListProps) {
-  const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const eventSourcesRef = useRef<Map<string, EventSource>>(new Map());
 
@@ -32,12 +33,10 @@ export default function DocumentList({
     } catch {
       return [];
     }
-  }, []);
+  }, [setDocuments]);
 
-  // Subscribe to SSE for a processing document
   const subscribeToStatus = useCallback(
     (docHash: string) => {
-      // Don't double-subscribe
       if (eventSourcesRef.current.has(docHash)) return;
 
       const url = getIngestStatusUrl(docHash);
@@ -60,34 +59,50 @@ export default function DocumentList({
       es.onerror = () => {
         es.close();
         eventSourcesRef.current.delete(docHash);
-        // Fallback: single refresh after a short delay
         setTimeout(refresh, 2000);
       };
     },
     [refresh]
   );
 
-  // Initial load
   useEffect(() => {
     setIsLoading(true);
     refresh().finally(() => setIsLoading(false));
   }, [refresh]);
 
-  // Subscribe to SSE for any documents that are still processing
-  // (handles page reloads while ingestion is running)
   useEffect(() => {
     documents
       .filter((d) => d.status === "processing")
       .forEach((d) => subscribeToStatus(d.doc_hash));
   }, [documents, subscribeToStatus]);
 
-  // Cleanup all EventSource connections on unmount
   useEffect(() => {
     return () => {
       eventSourcesRef.current.forEach((es) => es.close());
       eventSourcesRef.current.clear();
     };
   }, []);
+
+  const handleSelectDocument = useCallback(
+    (hash: string) => {
+      const prevHash = useDocStore.getState().selectedDocHash;
+      selectDocument(hash);
+      useViewerStore.getState().resetForNewDoc();
+      useInspectStore.getState().resetInspect();
+
+      // Auto-activate doc scope when selecting a document
+      useChatStore.getState().setDocScope("selected");
+
+      // Insert divider if switching documents mid-conversation
+      if (prevHash && prevHash !== hash) {
+        const filename = useDocStore.getState().selectedFilename;
+        if (filename && useChatStore.getState().messages.length > 0) {
+          useChatStore.getState().insertDivider(filename);
+        }
+      }
+    },
+    [selectDocument]
+  );
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -96,9 +111,7 @@ export default function DocumentList({
     setIsUploading(true);
     try {
       const result = await uploadDocument(file);
-      // Refresh list so the new doc appears with status="processing"
       await refresh();
-      // Subscribe to SSE for instant notification on completion
       subscribeToStatus(result.doc_hash);
     } catch (err) {
       alert(
@@ -112,14 +125,10 @@ export default function DocumentList({
 
   const statusLabel = (status: string) => {
     switch (status) {
-      case "processing":
-        return "Processing...";
-      case "completed":
-        return "Ready";
-      case "failed":
-        return "Failed";
-      default:
-        return status;
+      case "processing": return "Processing...";
+      case "completed": return "Ready";
+      case "failed": return "Failed";
+      default: return status;
     }
   };
 
@@ -137,10 +146,7 @@ export default function DocumentList({
             className="p-1 rounded hover:bg-[var(--bg-tertiary)]"
             title="Refresh"
           >
-            <RefreshCw
-              size={14}
-              className={isLoading ? "animate-spin" : ""}
-            />
+            <RefreshCw size={14} className={isLoading ? "animate-spin" : ""} />
           </button>
           <button
             onClick={() => fileInputRef.current?.click()}
@@ -171,7 +177,7 @@ export default function DocumentList({
         {documents.map((doc) => (
           <button
             key={doc.doc_hash}
-            onClick={() => onSelectDocument(doc.doc_hash)}
+            onClick={() => handleSelectDocument(doc.doc_hash)}
             disabled={doc.status === "processing"}
             className={`w-full text-left px-4 py-3 border-b border-[var(--border)] transition-colors ${
               doc.status === "processing"

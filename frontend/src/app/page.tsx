@@ -1,64 +1,106 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useEffect } from "react";
 import DocumentList from "@/components/DocumentList";
 import DocumentViewer from "@/components/DocumentViewer";
-import ChatPanel from "@/components/ChatPanel";
-import { Citation } from "@/lib/api";
+import RightPanel from "@/components/RightPanel";
+import { useDocStore } from "@/stores/useDocStore";
+import { useViewerStore } from "@/stores/useViewerStore";
+import { useChatStore } from "@/stores/useChatStore";
+import { useInspectStore } from "@/stores/useInspectStore";
+import { fetchPageChunks, fetchDocStats } from "@/lib/api";
 
 export default function Home() {
-  const [selectedDocHash, setSelectedDocHash] = useState<string | null>(null);
-  const [citations, setCitations] = useState<Citation[]>([]);
-  const [activeCitationIndex, setActiveCitationIndex] = useState<number | null>(
-    null
-  );
+  const selectedDocHash = useDocStore((s) => s.selectedDocHash);
+  const currentPage = useViewerStore((s) => s.currentPage);
+  const sidebarCollapsed = useViewerStore((s) => s.sidebarCollapsed);
+  const inspectMode = useInspectStore((s) => s.inspectMode);
 
-  const handleCitationsUpdate = useCallback((newCitations: Citation[]) => {
-    setCitations(newCitations);
-    setActiveCitationIndex(null);
-  }, []);
+  // ---------------------------------------------------------------------------
+  // Fetch chunks when inspect mode is active and page/document changes
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!inspectMode || !selectedDocHash) return;
 
-  const handleCitationClick = useCallback(
-    (index: number) => {
-      const citation = citations[index];
-      if (!citation) return;
+    let cancelled = false;
+    useInspectStore.getState().setInspectLoading(true);
+    useInspectStore.getState().setActiveChunkId(null);
 
-      // Auto-select the document if not already open
-      if (citation.doc_hash && citation.doc_hash !== selectedDocHash) {
-        setSelectedDocHash(citation.doc_hash);
-      }
+    fetchPageChunks(selectedDocHash, currentPage)
+      .then((data) => {
+        if (!cancelled) useInspectStore.getState().setInspectChunks(data.chunks);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.error("Failed to fetch chunks:", err);
+          useInspectStore.getState().setInspectChunks(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) useInspectStore.getState().setInspectLoading(false);
+      });
 
-      // Set active citation — DocumentViewer's useEffect navigates to the page
-      setActiveCitationIndex(index);
-    },
-    [citations, selectedDocHash]
-  );
+    return () => { cancelled = true; };
+  }, [inspectMode, selectedDocHash, currentPage]);
+
+  // ---------------------------------------------------------------------------
+  // Fetch document stats when document changes
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!selectedDocHash) {
+      useInspectStore.getState().setDocStats(null);
+      return;
+    }
+    fetchDocStats(selectedDocHash)
+      .then((stats) => useInspectStore.getState().setDocStats(stats))
+      .catch(() => useInspectStore.getState().setDocStats(null));
+  }, [selectedDocHash]);
+
+  // ---------------------------------------------------------------------------
+  // Compute chunk highlight bbox for DocumentViewer
+  // ---------------------------------------------------------------------------
+  const activeChunkId = useInspectStore((s) => s.activeChunkId);
+  const inspectChunks = useInspectStore((s) => s.inspectChunks);
+  const activeChunk =
+    inspectMode && activeChunkId
+      ? inspectChunks?.find((c) => c.chunk_id === activeChunkId) ?? null
+      : null;
+  const highlightBbox =
+    inspectMode && activeChunk?.bbox ? activeChunk.bbox : null;
+
+  // Citation overlay (only when not in inspect mode)
+  const activeCitationIndex = useChatStore((s) => s.activeCitationIndex);
+  const citations = useChatStore((s) => s.citations);
 
   return (
-    <div className="h-screen flex">
+    <div className="app-shell h-screen flex">
       {/* Left sidebar: Document list */}
-      <div className="w-64 border-r border-[var(--border)] bg-[var(--bg-secondary)] shrink-0">
-        <DocumentList
-          selectedDocHash={selectedDocHash}
-          onSelectDocument={setSelectedDocHash}
-        />
+      <div
+        className={`border-r border-[var(--border)] bg-[var(--bg-secondary)] shrink-0 transition-all duration-200 ${
+          sidebarCollapsed ? "w-0 overflow-hidden" : "w-64"
+        }`}
+      >
+        <DocumentList />
       </div>
 
       {/* Center: Document viewer */}
-      <div className="flex-1 min-w-0 bg-[var(--bg-primary)]">
+      <div className="flex-1 min-w-0 bg-[var(--bg-secondary)]">
         <DocumentViewer
-          docHash={selectedDocHash}
-          citations={citations}
-          activeCitationIndex={activeCitationIndex}
+          highlightBbox={highlightBbox}
+          activeCitation={
+            !inspectMode &&
+            activeCitationIndex !== null &&
+            activeCitationIndex < citations.length &&
+            citations[activeCitationIndex]?.bbox?.page_number === currentPage
+              ? citations[activeCitationIndex]
+              : null
+          }
         />
       </div>
 
-      {/* Right panel: Chat */}
+      {/* Right panel: Chat + Inspect tabs */}
       <div className="w-96 border-l border-[var(--border)] bg-[var(--bg-secondary)] shrink-0">
-        <ChatPanel
-          onCitationsUpdate={handleCitationsUpdate}
-          onCitationClick={handleCitationClick}
-        />
+        <RightPanel />
       </div>
     </div>
   );
