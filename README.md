@@ -16,7 +16,7 @@ Most RAG systems treat documents as flat text. Financial documents aren't flat t
 
 2. **Hybrid Search with Structured Analytics.** Qualitative content (narratives, summaries, insights) lives in Qdrant as dense+sparse vectors. Quantitative content (every extracted datapoint) lives in Postgres as pre-computed `metric_facts` rows. The query router decides which path — or both — to use.
 
-3. **Pixel-Precise Citations.** Every generated answer carries `[N]` citation markers. Each resolves to a `Citation` object with source file, page number, and normalized bounding box coordinates. The frontend renders these as clickable highlight overlays on the actual document page.
+3. **Fact-Scoped Citations.** Every generated answer carries `[N]` citation markers produced by structured output — the LLM never formats markers itself. Each badge resolves to a `Citation` with a fine-grained bounding box that highlights the specific value or sentence on the document page, not the entire table or chart region.
 
 ---
 
@@ -51,9 +51,9 @@ Most RAG systems treat documents as flat text. Financial documents aren't flat t
     │        │                                        │              │
     │   GENERATION                                    │              │
     │   ┌──────────────────────────────────────┐     │              │
-    │   │  GPT-4.1 Generation                   │<────┘              │
-    │   │  + Citation Sidecar                   │                    │
-    │   │  + Citation Verification              │                    │
+    │   │  GPT-4.1 Structured Output            │<────┘              │
+    │   │  + Citation Sidecar (fact-based dedup)│                    │
+    │   │  + Fine-Grained BBox Resolution       │                    │
     │   └──────────────┬───────────────────────┘                    │
     │                  │                                             │
     └──────────────────┼─────────────────────────────────────────────┘
@@ -122,6 +122,8 @@ The **Document Chunker** (`chunker.py`) flattens items into `IndexableChunk` obj
 - **NarrativeItem** — raw text with category and sentiment metadata
 - **HeaderItem** — header text with hierarchy level
 
+Each chunk carries spatial metadata: the coarse region bbox and (when available) a `value_bboxes` dictionary mapping individual values and sentences to their fine-grained pixel locations. This metadata flows through to Qdrant as payload fields, enabling per-value citation highlighting at query time without any re-parsing.
+
 Each chunk is embedded via **Cohere embed-v4** (1024 dims, multilingual, 100+ languages) and indexed with both dense vectors and **Qdrant native BM25** sparse vectors. Search uses **Reciprocal Rank Fusion (RRF)** to combine both signals.
 
 ### Postgres (Structured Analytics)
@@ -167,31 +169,89 @@ After RRF fusion, results pass through **Voyage Rerank 2.5** — a cross-encoder
 
 ## The Generation Pipeline
 
+### Why Structured Output (Not Free-Text Markers)
+
+Early iterations used free-text `[N]` markers — the LLM was instructed to write `[1]` inline. This failed in production for three reasons:
+
+1. **Hallucinated markers.** The LLM would emit `[7]` when only 5 sources existed.
+2. **Non-consecutive numbering.** `[1]`, `[3]`, `[5]` with gaps confused users.
+3. **Non-deterministic formatting.** Sometimes `[1]`, sometimes `(1)`, sometimes superscripts.
+
+The fix: **the LLM never writes `[N]` markers at all.** Instead it returns structured data, and Python controls all formatting.
+
 ### Citation Sidecar
 
-Retrieved chunks are mapped to ephemeral IDs `[1]`, `[2]`, etc. and formatted as XML source blocks for the generation LLM:
+Retrieved chunks are mapped to ephemeral integer IDs and formatted as XML source blocks for the generation LLM:
 
 ```xml
-<source id="[1]" file="deal_memo.pdf p.12" type="visual">
+<source id="1" file="deal_memo.pdf p.12" type="visual">
 Revenue grew 15% YoY driven by APAC expansion...
 </source>
 ```
 
-### Answer Generation
+The sidecar maintains a `sidecar_map: Dict[int, RetrievedChunk]` that maps each ID back to its chunk with full metadata (page, bbox, `value_bboxes`, `item_type`, `doc_hash`).
 
-GPT-4.1 generates answers with mandatory `[N]` citation markers. The system prompt enforces: respond in the query's language, cite every factual claim, include currency/magnitude/period for numbers.
+### Structured Answer Generation
 
-### Citation Verification
+GPT-4.1 uses `with_structured_output(StructuredAnswer)` to return a Pydantic-validated response:
 
-A lightweight LLM pass checks that each cited source actually supports the claim made. Unsupported citations are dropped before the response reaches the user.
+```python
+class CitedSegment(BaseModel):
+    text: str          # "Alphabet's free cash flow for Q4 2024 was $24,837 million."
+    source_ids: list   # [3]  — integer ID from the <source> tags
 
-### Citation Resolution
+class StructuredAnswer(BaseModel):
+    segments: list     # List[CitedSegment]
+```
 
-`[N]` markers in the generated text are resolved to `Citation` objects containing:
-- `source_file` — original filename
-- `page_number` — 1-based page
-- `blurb` — the source text snippet
-- `bbox` — normalized 0-1 bounding box for frontend highlighting
+Each segment is a sentence or short passage with explicit source IDs. The LLM's job is only to write the answer text and link it to sources — it never formats citation markers.
+
+### Fact-Based Citation Assembly
+
+`assemble_cited_answer()` transforms structured segments into the final answer with `[N]` badges:
+
+**Step 1: Per-segment dedup.** Within each segment, all `source_ids` support the same factual claim. We keep only the first valid source. This eliminates redundant badges like `[1][2]` when both cite the same number from different pages.
+
+**Step 2: Badge assignment.** Unique source IDs are numbered consecutively by first-appearance order. No global dedup across segments — different claims always get separate badges, even if their sources are on the same page.
+
+**Step 3: Fact-scoped citing texts.** Each badge's "citing texts" are collected only from the segments where that badge appears. This is critical for bbox resolution: if badge `[1]` appears in "$24,837 million" and badge `[2]` appears in "FCF is defined as net cash less capital expenditures", each badge resolves its bbox from its own sentence context — not from a combined pool.
+
+**Why per-fact, not per-page or per-item-type?** Earlier versions deduped by page number (all sources on page 10 → one badge). This collapsed distinct content: a table cell showing `$24,837` and a narrative paragraph defining FCF both lived on page 10 but served completely different citation purposes. The fact-based approach uses the LLM's own segmentation as the dedup boundary — the segment text IS the fact, so dedup within it removes true redundancy while preserving cross-fact diversity.
+
+### Fine-Grained BBox Resolution
+
+The standard approach to citation highlighting — draw a box around the entire table or chart region — is unacceptable in finance. When a user asks "what was Q4 free cash flow?" and clicks `[1]`, they expect to see the specific `$24,837` cell highlighted, not the entire 8-column reconciliation table.
+
+Centaur solves this with a two-phase system:
+
+**Phase 1 (Ingestion Time): Build `value_bboxes`.** During document parsing, each item computes a `Dict[str, List[List[float]]]` mapping values to their pixel locations:
+
+| Item Type | Key Format | Source |
+|-----------|-----------|--------|
+| **FinancialTableItem** | Cell text (`"24,837"`, `"(13,186)"`) | Docling `table_cells[i].bbox` |
+| **VisualItem** | Normalized float (`"8090.0"`) + series label (`"YouTube Ads"`) | OCR word bboxes matched against VLM-extracted MetricSeries |
+| **NarrativeItem** | Sentence text (`"We define free cash flow as..."`) | PyMuPDF word bboxes grouped by `(block_no, line_no)` for per-line AABBs |
+
+Each key maps to `List[List[float]]` (not a single bbox) to handle:
+- **Duplicate values:** `"0"` appears in 5 table cells → 5 bboxes
+- **Multi-line wrapping:** A sentence spanning 2 visual lines → 2 bbox entries
+
+`value_bboxes` is stored as metadata on each chunk in Qdrant.
+
+**Phase 2 (Query Time): Resolve from citing text.** When building a Citation, `_resolve_fine_bbox()` matches values from the answer text against the chunk's `value_bboxes` through a 6-tier cascade:
+
+| Tier | Pattern | Example Match |
+|------|---------|---------------|
+| 1 | Dollar amounts | `$24,837` → try `"$24,837"`, `"24,837"`, `"24837"`, `"24837.0"` |
+| 2 | Percentages | `25%` → try `"25%"`, `"25"` |
+| 3 | Plain numbers | `24,837` → try raw, stripped, float form, parenthesized `(24,837)` |
+| 4 | Series labels | Chunk metadata `series_label` → try as key |
+| 5 | Sentence text | Word-overlap (Jaccard) matching against sentence-keyed entries (>35% threshold) |
+| 6 | Coarse fallback | Entire table/chart region bbox from chunk metadata |
+
+Tier 5 handles the narrative case. The LLM might write "FCF is defined as net cash provided by operating activities less capital expenditures" while the document says "We define free cash flow as net cash provided by operating activities less capital expenditures." Exact matching fails, but word overlap (Jaccard similarity) catches it — both sentences share most of their words despite different phrasing.
+
+The tier ordering reflects a principle: **numbers are unique identifiers, text is ambiguous.** `$24,837` almost certainly refers to one specific cell. But a sentence like "Revenue grew in Q1" could match several narrative passages, so we only try text matching after numeric tiers fail.
 
 ---
 
@@ -221,11 +281,18 @@ A three-panel Next.js application:
 
 | Panel | Component | Function |
 |-------|-----------|----------|
-| **Left Sidebar** | `DocumentList` | Upload PDFs, browse ingested documents |
-| **Center** | `DocumentViewer` | PDF.js page renderer with bbox highlight overlays |
+| **Left Sidebar** | `DocumentList` | Upload PDFs, browse ingested documents, status indicators |
+| **Center** | `DocumentViewer` | PDF.js page renderer with active citation highlight overlay |
 | **Right** | `ChatPanel` | Conversational interface with clickable `[N]` citation badges |
 
-Clicking a citation badge in the chat highlights the corresponding region on the document page. Coordinates scale from normalized 0-1 values to pixel positions: `left = bbox.x * containerWidth`.
+### Citation Interaction Flow
+
+1. User asks a question. The backend streams the answer via SSE with inline `[N]` markers.
+2. `ChatPanel` parses markers and renders them as blue clickable badges.
+3. User clicks badge `[1]`. The frontend reads `citation.doc_hash` to auto-select the document (if not already open), navigates `DocumentViewer` to the cited page, and renders a `BboxOverlay` highlight on the specific value or sentence.
+4. Only the **active citation** is highlighted — no visual clutter from other citations on the same page.
+
+The `BboxOverlay` component scales normalized 0-1 coordinates to pixel positions (`left = bbox.x * containerWidth`) with a small uniform padding (0.003 in normalized coords) for visual breathing room. The highlight uses a semi-transparent yellow fill with a thin red border — visible enough to locate the cited value without obscuring the underlying text.
 
 ---
 
@@ -268,7 +335,7 @@ centaur/
 │   ├── retrieval/                         # READ PATH
 │   │   ├── qdrant.py                      # Full pipeline (expand -> search -> rerank)
 │   │   ├── term_injector.py               # Multilingual query expansion + label matching
-│   │   └── sidecar.py                     # Citation sidecar (build -> resolve -> verify)
+│   │   └── sidecar.py                     # Citation sidecar (build context, assemble, fine-grained bbox)
 │   │
 │   ├── storage/                           # DATA LAYER
 │   │   ├── vector_driver.py               # Qdrant hybrid index (Cohere + BM25 + RRF)
@@ -292,7 +359,7 @@ centaur/
 │   │   └── nodes/
 │   │       ├── retrieve.py                # Retrieval nodes (qualitative, quantitative, hybrid)
 │   │       ├── financial_math.py          # Text-to-SQL over metric_facts
-│   │       └── generate.py                # GPT-4.1 generation + citation verification
+│   │       └── generate.py                # Structured output generation + fact-based citation assembly
 │   │
 │   ├── api/                               # FASTAPI SERVER
 │   │   ├── main.py                        # App setup, CORS, startup initialization
@@ -423,7 +490,7 @@ All extracted insights are classified into five categories:
 
 1. **No Mental Math.** The LLM never performs arithmetic. All calculations use `resolved_value` (pre-computed in Python) or the calculator tool.
 
-2. **Mandatory Citations.** Every generated factual claim must carry a `[N]` marker that resolves to a verifiable source location.
+2. **Mandatory Citations via Structured Output.** The LLM returns `{segments: [{text, source_ids}]}` — it never writes `[N]` markers in prose. Python assembles, deduplicates, and formats all citation markers deterministically. Every factual claim resolves to a verifiable source location with a fine-grained bounding box.
 
 3. **Token Firewall.** Headers, footers, and decorative artifacts are stripped before embedding to prevent noise in the vector index.
 
