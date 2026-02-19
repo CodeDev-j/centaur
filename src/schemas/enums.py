@@ -39,13 +39,26 @@ MagnitudeType: TypeAlias = Literal[
 # 3. SEMANTICS (Category & Sentiment)
 # ==============================================================================
 CategoryType: TypeAlias = Literal[
-    "Financial", 
-    "Operational", 
-    "Strategic", 
-    "External", 
-    "Deal_Math"
+    "Financial",      # Historical ledger facts (P&L, BS, CF, bridge components)
+    "Operational",    # Historical non-ledger KPIs (headcount, production, utilisation)
+    "Market",         # Industry structure, TAM, competitive dynamics, macro commentary
+    "Strategic",      # Decisions/corporate events by management OR shareholders/owners (past or future)
+    "Transactional",  # Deal terms, financing, capital structure, covenants, returns
 ]
 
 SentimentType: TypeAlias = Literal[
     "Positive", "Negative", "Neutral", "Unknown"
+]
+
+# ==============================================================================
+# 4. CHART SEMANTICS
+# ==============================================================================
+SeriesNatureType: TypeAlias = Literal[
+    "level",  # Absolute stock value (e.g. EBIT = €14,224M; bar rooted to x-axis)
+    "delta",  # Period-over-period change or bridge driver (e.g. Δ FX = +€41M; floating bar)
+]
+
+StatedDirectionType: TypeAlias = Literal[
+    "positive_contributor",  # Chart explicitly marks with '+', up-arrow, or equivalent
+    "negative_contributor",  # Chart explicitly marks with '–', down-arrow, or equivalent
 ]

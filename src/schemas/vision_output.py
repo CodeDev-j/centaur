@@ -37,11 +37,12 @@ D. **Structural Hierarchy:** The schema enforces a strict hierarchy (Page -> Ser
 from typing import Annotated, List, Optional, Any
 from pydantic import BaseModel, Field, BeforeValidator, model_validator, ConfigDict
 from src.schemas.enums import (
-    PeriodicityType, 
-    CurrencyType, 
-    MagnitudeType, 
-    CategoryType, 
-    SentimentType
+    PeriodicityType,
+    CurrencyType,
+    MagnitudeType,
+    CategoryType,
+    SeriesNatureType,
+    StatedDirectionType,
 )
 
 # ==============================================================================
@@ -255,14 +256,67 @@ class MetricSeries(BaseModel):
     accounting_basis: Optional[str] = Field(
         default=None,
         description="""
-        Financial methodology flag extracted from series label context.
-        Use strict controlled vocabulary:
-        - 'GAAP' (or IFRS)
-        - 'Adjusted' (for Non-GAAP, Underlying)
-        - 'Pro Forma' (for PF, Projected)
-        - 'Pro Forma Adjusted' (Compound)
-        - 'Run-Rate'
-        Only populate if explicitly stated.
+        Financial methodology qualifier for THIS series specifically.
+        Search TWO sources in strict order:
+
+        1. THE LABEL (Primary): Read the series_label for qualifying terms
+           (e.g., 'EBIT Adjusted' -> 'Adjusted', 'PF LTM EBITDA' -> 'Pro Forma').
+
+        2. FOOTNOTES (Secondary — specificity-gated): A footnote may only inform
+           this field if it is specifically tied to THIS series, via either:
+           - A matching footnote marker on the label (e.g., '*', '†', '1'), OR
+           - The footnote explicitly names this series (e.g., 'PF Adj. EBITDA
+             includes pro forma impact of ABC acquisition' -> confirms
+             basis='Pro Forma Adjusted' for the 'PF Adj. EBITDA' series).
+           FORBIDDEN: Do NOT apply a footnote to this series if it names a
+           DIFFERENT series on the same chart.
+
+        If qualifying terms are found in EITHER source, you MUST populate this
+        field. Leave null ONLY if no qualifying term is traceable to THIS series.
+
+        Common terms and their canonical forms:
+        - 'Adjusted', 'Adj.', 'Non-GAAP', 'Underlying' -> 'Adjusted'
+        - 'Pro Forma', 'PF' -> 'Pro Forma'
+        - 'Run-Rate', 'RR', 'Annualized' -> 'Run-Rate'
+        - 'GAAP', 'IFRS', 'Reported' -> 'GAAP'
+        - Compound (e.g., 'PF Adjusted', 'Adj. Run-Rate') -> use the compound form.
+
+        SCOPE BOUNDARY: This field is for financial statement methodology ONLY.
+        Do NOT use it for market research or forecast data — use 'data_provenance'.
+        """
+    )
+
+    # [MARKET & RESEARCH DATA PROVENANCE]
+    data_provenance: Optional[str] = Field(
+        default=None,
+        description="""
+        Captures the estimation methodology or source type for NON-financial-statement
+        data (e.g., market research, CDD data, third-party benchmarks).
+        Leave null for audited company financial statements.
+
+        Populate from TWO dimensions — combine if both are present:
+
+        1. DATA ORIGIN (who produced it):
+           - 'Management Estimate' — company-provided, unaudited
+           - 'Third-Party Research' — from a named research firm (Gartner, Bain, IDC, etc.)
+           - 'Consensus' — aggregated analyst estimates
+
+        2. TEMPORAL NATURE (historical vs forward-looking):
+           - 'Historical' — reported actuals (e.g., '2022A', '2023A')
+           - 'Estimated' — approximate or survey-derived (e.g., market size '~$50B')
+           - 'Forecast' — projected future values (e.g., '2025E', '2027F', 'CAGR')
+
+        DETECTION SIGNALS (check in order):
+        1. Axis label suffixes: 'A' or 'Actual' -> 'Historical'; 'E', 'F', 'P',
+           or 'Est.' suffix -> 'Forecast'.
+        2. Chart title or subtitle: 'Market Forecast', 'Bottom-Up TAM' -> 'Forecast'.
+        3. Source footnote: 'Source: Gartner' -> 'Third-Party Research'.
+        4. Mixed series (some historical, some forecast): use 'Historical and Forecast'.
+
+        Examples:
+        - TAM chart sourced from Bain with 2025E labels -> 'Third-Party Research; Forecast'
+        - Management-prepared revenue bridge with actuals -> leave null (financial statement)
+        - Consensus EBITDA estimates chart -> 'Consensus; Forecast'
         """
     )
 
@@ -285,6 +339,24 @@ class MetricSeries(BaseModel):
         """
     )
 
+    series_nature: SeriesNatureType = Field(
+        default="level",
+        description="""
+        The semantic nature of this series' values.
+        - 'level' : An absolute stock value at a point in time.
+                    Examples: EBIT = €14,224M; Revenue = $500M.
+                    Waterfall: bars rooted to the X-axis ("Stock" bars).
+        - 'delta' : A signed period-over-period change or bridge driver.
+                    Examples: Δ FX = +€41M; YoY revenue growth = -3%.
+                    Waterfall: floating bars ("Flow" bars).
+                    Also applies to variance charts, budget-vs-actual bars,
+                    and any series whose values represent changes rather than levels.
+        CRITICAL: Always set 'delta' when values represent changes. Downstream
+        systems use this to avoid misreading a signed change (e.g. Δ Selling
+        expenses = +€41M) as an absolute figure (Selling expenses = €41M).
+        """
+    )
+
     data_points: List[DataPoint] = Field(default_factory=list)
 
 
@@ -299,34 +371,49 @@ class Insight(BaseModel):
     category: CategoryType = Field(
         ...,
         description="""
-        Classify using these STRICT PRIORITY RULES (The "Nature of Fact"):
+        Classify by the TYPE of assertion, NOT the topic. The same topic
+        (FX, Capex, Legal proceedings) can belong to different categories.
 
-        1. 'Financial' (THE LEDGER RULE): 
-           Historical facts from the P&L, Balance Sheet, or Cash Flow.
-           
-        2. 'Operational' (THE ENGINE ROOM):
-           Business metrics that drive the financials. 
-           Examples: Headcount, Production Volumes, User Counts, Efficiency Ratios.
+        1. 'Financial' — "What did the ledger record?"
+           Quantitative facts from the P&L, Balance Sheet, or Cash Flow — historical
+           or projected financial statement line items.
+           BRIDGE RULE: Any insight explaining WHY a metric changed (variance/waterfall
+           drivers) is Financial regardless of the underlying topic.
+           Examples: "EBIT fell due to volume/pricing." | "Legal add-back +€94M in 2023."
 
-        3. 'Strategic' (THE AGENCY RULE):
-           Forward-looking plans or decisions made by management.
-           Examples: M&A, R&D Investment, Product Launches, Guidance/Outlook.
-           
-        4. 'External' (THE ENVIRONMENT):
-           Factors outside the company's control.
-           Examples: Macroeconomics, Competitor Moves, Regulation, FX Rates.
-           
-        5. 'Deal_Math' (VALUATION):
-           Specific mentions of Multiples (12.5x), Synergies, or Purchase Price.
-           
-        *EXCLUDED*: 'Sentiment' (Do not capture subjective spin or fluff).
-        """
-    )
+        2. 'Operational' — "How did the business run?"
+           Non-ledger business metrics describing operating performance.
+           Examples: Headcount, Production Volumes, Utilisation Rates, Customer Counts.
 
-    topic: str = Field(
-        ..., 
-        description="""
-        Subject (e.g., 'EBITDA Growth' or '2008 Event').
+        3. 'Market' — "What does the industry or environment look like?"
+           Market structure, TAM/SAM/SOM, competitive dynamics, sector trends, and
+           macro commentary. Distinct from the company's own reported performance.
+           Examples: Market size, CAGR, competitive positioning, regulatory context.
+
+        4. 'Strategic' — "What decision or corporate event occurred or is planned?"
+           Any assertion about a decision or corporate event by those with agency —
+           management OR shareholders/owners — regardless of whether it is past,
+           present, or future. This preserves historical strategic context across
+           a multi-year deal lifecycle.
+           - Management: M&A (completed or planned), product launches, R&D direction,
+             restructuring decisions, Capex programmes.
+           - Shareholders/Owners: PE sponsor directives, exit events or planning,
+             dividend policy, ownership restructuring, co-investor or JV strategy.
+           DISTINCTION: The restructuring charge on the P&L is Financial. The
+           decision to restructure (past or future) is Strategic. Historical M&A
+           context ("the company acquired XYZ in 2021") is Strategic; the resulting
+           revenue contribution is Financial.
+
+        5. 'Transactional' — "How was the deal structured and financed?"
+           Anything describing the transaction itself rather than the business:
+           purchase price, entry/exit multiples, synergies, debt tranche terms
+           (pricing, maturity, amortisation), leverage metrics at close, covenant
+           thresholds, and returns analysis (IRR, MoM, yield-to-maturity).
+           EDGE CASE: Actual leverage ratio (4.2x Net Debt/EBITDA) = Financial.
+           The covenant it is tested against (e.g., 5.5x maximum) = Transactional.
+
+        *EXCLUDED*: Do not capture subjective spin, qualitative fluff, or
+        assertions that cannot be traced to a specific observable fact.
         """
     )
 
@@ -352,10 +439,14 @@ class Insight(BaseModel):
         """
     )
     
-    sentiment_direction: SentimentType = Field(
-        default="Neutral",
+    stated_direction: Optional[StatedDirectionType] = Field(
+        default=None,
         description="""
-        Impact on the Investment Case (Positive/Negative/Neutral).
+        Populate ONLY when the chart explicitly marks this annotation with a
+        directional symbol (e.g. a '+' bullet, '–' bullet, up/down arrow).
+        Do NOT infer from content — if no symbol is present, leave null.
+        Example: Mercedes-Benz bridge uses blue '+' and red '–' bullets;
+        capture those signals here.
         """
     )
     
@@ -401,14 +492,24 @@ class VisionPageResult(BaseModel):
         3. CHART TYPE: Identify the structure (Stacked, Waterfall, Pie, Valuation).
         4. LEGENDS: Explain how you mapped Colors to Legends.
         5. CONTEXT: Note any Financial Context flags (Adjusted, Pro Forma).
+           If Adjustment bars are present, explicitly state their neighbours:
+           "Left=Reported, Right=Adjusted → positive bar is add-back" OR
+           "Left=Adjusted, Right=Reported → positive bar is deduction."
         6. ANOMALIES: Flag missing data, discontinuities, or annotations.
-        7. MATH CHECK (CRITICAL): 
+        7. MATH CHECK (CRITICAL):
            - Perform a summation/logic check on the visible numbers.
            - Waterfall: Start + Sum(Deltas) ≈ End.
            - Stacked / Pie: Sum(Parts) ≈ Total (or 100%).
            - Valuation Field: Low Value < Mean/Median < High Value.
            - Table: Check Row/Column Totals if explicit.
            - If the math fails, RE-READ the labels to find the error.
+        8. CONFIDENCE & ANNOTATIONS:
+           - Assign confidence_score (0.0-1.0) to the root `confidence_score` field.
+             Base it on visual clarity, OCR legibility, and math check outcome.
+             High confidence = clear labels + math checks pass. Do NOT leave at default 0.
+           - List any floating text callouts or qualitative annotations you see
+             (e.g., "Operational efficiencies outweigh one-time payments"). Each
+             becomes a separate entry in `insights`. If none exist, state "No annotations."
         """
     )
 

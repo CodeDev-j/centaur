@@ -1,103 +1,275 @@
+"""
+Vector Driver: The Search Truth (Upgraded).
+
+Manages hybrid vector indexing and search in Qdrant:
+- Dense vectors via Cohere embed-v4 (multilingual, 1024 dims)
+- Sparse vectors via Qdrant native BM25 (exact term matching)
+- Reciprocal Rank Fusion (RRF) for combining results
+
+Replaces the original fastembed/bge-small-en-v1.5 driver.
+"""
+
 import logging
-import os
-from typing import List, Iterable
+from typing import List, Optional, Dict, Any
 from uuid import uuid4
 
-# Third-party
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from fastembed import TextEmbedding
+import cohere
+from fastembed import SparseTextEmbedding
+from qdrant_client import QdrantClient, models
 from langsmith import traceable
 
-# Internal
-from src.schemas.documents import IngestedChunk
+from src.config import SystemConfig
 
 logger = logging.getLogger(__name__)
 
+
+class IndexableChunk:
+    """
+    Lightweight container for a chunk ready to be indexed.
+    Created by src/ingestion/chunker.py, consumed here.
+    """
+
+    def __init__(
+        self,
+        chunk_id: str,
+        doc_id: str,
+        doc_hash: str,
+        source_file: str,
+        page_number: int,
+        item_id: str,
+        item_type: str,
+        text: str,
+        metadata: Dict[str, Any],
+    ):
+        self.chunk_id = chunk_id
+        self.doc_id = doc_id
+        self.doc_hash = doc_hash
+        self.source_file = source_file
+        self.page_number = page_number
+        self.item_id = item_id
+        self.item_type = item_type
+        self.text = text
+        self.metadata = metadata
+
+
 class VectorDriver:
     """
-    Helix C: The Indexer.
-    Responsible for the 'Search Truth'.
-    1. Embeds text locally (FastEmbed) -> No API costs.
-    2. Upserts vectors to Qdrant (Docker).
+    Helix C: The Indexer (Upgraded).
+    1. Embeds text via Cohere embed-v4 API (multilingual, 1024 dims).
+    2. Generates BM25 sparse vectors via Qdrant's native tokenizer.
+    3. Upserts hybrid vectors (dense + sparse) to Qdrant.
+    4. Searches with Reciprocal Rank Fusion (RRF).
     """
 
-    # We use a specific collection name for the credit knowledge base
     COLLECTION_NAME = "chiron_knowledge_base"
-    
-    # FastEmbed Model (Local, CPU-optimized, SOTA performance)
-    # BAAI/bge-small-en-v1.5 is the current gold standard for local RAG
-    EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+    DENSE_VECTOR_NAME = "dense"
+    SPARSE_VECTOR_NAME = "sparse"
 
     def __init__(self):
-        # connect to Qdrant running in Docker
         self.client = QdrantClient(host="localhost", port=6333)
-        
-        # Initialize the embedding model (downloads automatically on first run)
-        logger.info(f"🧠 Loading Embedding Model: {self.EMBEDDING_MODEL_NAME}...")
-        self.embedding_model = TextEmbedding(model_name=self.EMBEDDING_MODEL_NAME)
-        
-        # Ensure the collection exists
+
+        if not SystemConfig.COHERE_API_KEY:
+            raise ValueError(
+                "Missing COHERE_API_KEY in environment. "
+                "Set it in .env to use Cohere embed-v4."
+            )
+        self.cohere_client = cohere.AsyncClientV2(
+            api_key=SystemConfig.COHERE_API_KEY
+        )
+
+        # BM25 sparse embeddings via fastembed (local, no API calls)
+        self.sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
+
         self._ensure_collection()
+        logger.info(
+            f"Search Truth initialized. "
+            f"Collection: {self.COLLECTION_NAME} | "
+            f"Dense: Cohere {SystemConfig.EMBEDDING_MODEL} ({SystemConfig.EMBEDDING_DIMS}d) | "
+            f"Sparse: Qdrant BM25"
+        )
 
     def _ensure_collection(self):
         """
-        Idempotent check to create the collection if it doesn't exist.
+        Creates collection with named dense + sparse vectors.
+        Idempotent — skips if collection already exists with correct config.
         """
-        if not self.client.collection_exists(self.COLLECTION_NAME):
-            logger.info(f"Creating Qdrant collection: {self.COLLECTION_NAME}")
-            self.client.create_collection(
-                collection_name=self.COLLECTION_NAME,
-                vectors_config=models.VectorParams(
-                    size=384,  # bge-small-en-v1.5 dimension
-                    distance=models.Distance.COSINE
-                )
-            )
+        if self.client.collection_exists(self.COLLECTION_NAME):
+            return
 
-    @traceable(name="Index Chunks", run_type="tool")
-    def index(self, chunks: List[IngestedChunk]) -> bool:
+        logger.info(f"Creating Qdrant collection: {self.COLLECTION_NAME}")
+        self.client.create_collection(
+            collection_name=self.COLLECTION_NAME,
+            vectors_config={
+                self.DENSE_VECTOR_NAME: models.VectorParams(
+                    size=SystemConfig.EMBEDDING_DIMS,
+                    distance=models.Distance.COSINE,
+                )
+            },
+            sparse_vectors_config={
+                self.SPARSE_VECTOR_NAME: models.SparseVectorParams(
+                    modifier=models.Modifier.IDF,
+                )
+            },
+        )
+
+    @traceable(name="Embed Texts (Cohere)", run_type="tool")
+    async def _embed_texts(
+        self, texts: List[str], input_type: str = "search_document"
+    ) -> List[List[float]]:
         """
-        Main entry point. Takes parsed chunks, embeds them, and saves to Qdrant.
+        Batch embed via Cohere embed-v4.
+
+        input_type: "search_document" for indexing, "search_query" for queries.
+        """
+        response = await self.cohere_client.embed(
+            texts=texts,
+            model=SystemConfig.EMBEDDING_MODEL,
+            input_type=input_type,
+            embedding_types=["float"],
+        )
+        return response.embeddings.float_
+
+    @traceable(name="Index Chunks (Hybrid)", run_type="tool")
+    async def index(self, chunks: List[IndexableChunk]) -> bool:
+        """
+        Indexes chunks with both dense (Cohere) and sparse (BM25) vectors.
         """
         if not chunks:
             return False
 
-        try:
-            texts = [chunk.clean_text for chunk in chunks]
-            
-            # 1. Generate Embeddings (Local CPU)
-            # FastEmbed handles batching automatically
-            embeddings = list(self.embedding_model.embed(texts))
-            
-            # 2. Prepare Payload (Metadata)
-            points = []
-            for i, chunk in enumerate(chunks):
-                # We store minimal metadata in Qdrant.
-                # Full content is in Blobs, but we keep text here for simpler retrieval.
-                payload = {
-                    "source": chunk.metadata.get("source"),
-                    "page": chunk.page_number,
-                    "type": chunk.metadata.get("type", "text"),
-                    "text": chunk.clean_text, # Storing text allows retrieval without blob lookup
-                    "doc_hash": chunk.doc_hash,
-                    "chunk_id": chunk.chunk_id
-                }
-                
-                points.append(models.PointStruct(
-                    id=chunk.chunk_id, # We use the UUID generated in the parser
-                    vector=embeddings[i],
-                    payload=payload
-                ))
+        texts = [c.text for c in chunks]
 
-            # 3. Upsert to Qdrant
-            self.client.upsert(
-                collection_name=self.COLLECTION_NAME,
-                points=points
+        # 1. Dense embeddings via Cohere
+        dense_embeddings = await self._embed_texts(texts, input_type="search_document")
+
+        # 2. Sparse embeddings via fastembed BM25 (local)
+        sparse_embeddings = list(self.sparse_model.embed(texts))
+
+        # 3. Build points with named vectors and payloads
+        points = []
+        for i, chunk in enumerate(chunks):
+            payload = {
+                "doc_id": chunk.doc_id,
+                "doc_hash": chunk.doc_hash,
+                "source_file": chunk.source_file,
+                "page_number": chunk.page_number,
+                "item_id": chunk.item_id,
+                "item_type": chunk.item_type,
+                "chunk_text": chunk.text,
+                **chunk.metadata,
+            }
+
+            sparse = sparse_embeddings[i]
+            point = models.PointStruct(
+                id=chunk.chunk_id,
+                vector={
+                    self.DENSE_VECTOR_NAME: dense_embeddings[i],
+                    self.SPARSE_VECTOR_NAME: models.SparseVector(
+                        indices=sparse.indices.tolist(),
+                        values=sparse.values.tolist(),
+                    ),
+                },
+                payload=payload,
             )
-            
-            logger.info(f"✅ Indexed {len(points)} chunks into Qdrant.")
-            return True
+            points.append(point)
 
-        except Exception as e:
-            logger.error(f"❌ Indexing failed: {e}")
-            raise e
+        # 3. Upsert to Qdrant
+        self.client.upsert(
+            collection_name=self.COLLECTION_NAME,
+            points=points,
+        )
+
+        # 4. Update BM25 sparse index via Qdrant's document API
+        # Qdrant native BM25 uses the payload text field for tokenization.
+        # We configure a text index on chunk_text for sparse search.
+        self._ensure_text_index()
+
+        logger.info(f"Indexed {len(points)} chunks (dense + sparse).")
+        return True
+
+    def _ensure_text_index(self):
+        """
+        Creates a full-text index on chunk_text for Qdrant native BM25.
+        Idempotent — Qdrant ignores if index already exists.
+        """
+        try:
+            self.client.create_payload_index(
+                collection_name=self.COLLECTION_NAME,
+                field_name="chunk_text",
+                field_schema=models.TextIndexParams(
+                    type=models.TextIndexType.TEXT,
+                    tokenizer=models.TokenizerType.MULTILINGUAL,
+                    min_token_len=2,
+                    max_token_len=40,
+                ),
+            )
+        except Exception:
+            pass  # Index already exists
+
+    @traceable(name="Search Hybrid (RRF)", run_type="tool")
+    async def search_hybrid(
+        self,
+        query_text: str,
+        query_dense: Optional[List[float]] = None,
+        limit: int = 20,
+        score_threshold: float = 0.0,
+        filters: Optional[models.Filter] = None,
+    ) -> List[models.ScoredPoint]:
+        """
+        Executes hybrid search: dense (Cohere) + sparse (BM25), fused via RRF.
+
+        If query_dense is not provided, embeds query_text via Cohere first.
+        """
+        if query_dense is None:
+            embeddings = await self._embed_texts(
+                [query_text], input_type="search_query"
+            )
+            query_dense = embeddings[0]
+
+        # Generate sparse query vector via fastembed BM25
+        sparse_results = list(self.sparse_model.embed([query_text]))
+        query_sparse = models.SparseVector(
+            indices=sparse_results[0].indices.tolist(),
+            values=sparse_results[0].values.tolist(),
+        )
+
+        results = self.client.query_points(
+            collection_name=self.COLLECTION_NAME,
+            prefetch=[
+                models.Prefetch(
+                    query=query_dense,
+                    using=self.DENSE_VECTOR_NAME,
+                    limit=limit,
+                    filter=filters,
+                ),
+                models.Prefetch(
+                    query=query_sparse,
+                    using=self.SPARSE_VECTOR_NAME,
+                    limit=limit,
+                    filter=filters,
+                ),
+            ],
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=limit,
+            score_threshold=score_threshold,
+            with_payload=True,
+        )
+
+        return results.points
+
+    async def delete_by_doc_hash(self, doc_hash: str) -> None:
+        """Removes all points for a given document hash."""
+        self.client.delete(
+            collection_name=self.COLLECTION_NAME,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="doc_hash",
+                            match=models.MatchValue(value=doc_hash),
+                        )
+                    ]
+                )
+            ),
+        )
+        logger.info(f"Deleted vectors for doc_hash: {doc_hash[:8]}...")

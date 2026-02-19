@@ -21,7 +21,8 @@ from src.schemas.layout_output import VisualArchetype
 from src.schemas.enums import (
     PeriodicityType,
     CurrencyType,
-    SentimentType
+    SentimentType,
+    CategoryType
 )
 
 from src.schemas.vision_output import MetricSeries
@@ -33,8 +34,7 @@ from src.schemas.vision_output import MetricSeries
 class SourceRef(BaseModel):
     """
     Lightweight lineage. Points strictly to the origin location.
-    Geometry is stripped here to save tokens; the UI should look up 
-    precise coordinates via the separate Layout DB using 'layout_id'.
+    Normalized bbox (0-1) carried for citation overlays in the viewer.
     """
     # Soft Handshake: Ignore extra noise to prevent blocking errors
     model_config = ConfigDict(extra='ignore')
@@ -54,9 +54,16 @@ class SourceRef(BaseModel):
     layout_id: Optional[str] = Field(
         None,
         description="""
-        Link to the detailed Layout DB record (which contains the precise BBox).
+        Link to the layout region ID (ChartRegion.region_id).
         """
     )
+
+    # Normalized bounding box (0.0-1.0) for citation overlays.
+    # Converted from ChartRegion's 0-1000 grid at creation time.
+    bbox_x: Optional[float] = Field(None, description="Left X (0-1)")
+    bbox_y: Optional[float] = Field(None, description="Top Y (0-1)")
+    bbox_width: Optional[float] = Field(None, description="Width (0-1)")
+    bbox_height: Optional[float] = Field(None, description="Height (0-1)")
 
 class BaseDocItem(BaseModel):
     # Soft Handshake: Ignore extra noise from Parser/LLM
@@ -116,11 +123,19 @@ class HeaderItem(BaseDocItem):
 
 class NarrativeItem(BaseDocItem):
     """
-    Replaces generic 'TextItem'. 
+    Replaces generic 'TextItem'.
     Captures the qualitative arguments of the deal.
     """
     type: Literal["narrative"] = "narrative"
-    
+
+    # Fine-grained citation bboxes (per-sentence, per-line)
+    value_bboxes: Optional[Dict[str, List[List[float]]]] = Field(
+        default=None,
+        description="""Per-value bounding boxes for fine-grained citation highlighting.
+        Keys: sentence text. Values: list of [bbox_x, bbox_y, bbox_w, bbox_h] (0-1 normalized).
+        Multiple bboxes per key handle multi-line wrapping."""
+    )
+
     text_content: str = Field(
         ...,
         description="""
@@ -144,9 +159,19 @@ class NarrativeItem(BaseDocItem):
         """
     )
     
+    # Insight Category (propagated from VLM Insight.category)
+    category: Optional[CategoryType] = Field(
+        None,
+        description="""
+        The 5-way insight category (Financial, Operational, Market, Strategic,
+        Transactional). Propagated from VLM Insight.category when this
+        NarrativeItem was derived from a visual insight. None for Docling text.
+        """
+    )
+
     # The "Hybrid Claim": Linking text to numbers
     referenced_metrics: Optional[List[dict]] = Field(
-        None, 
+        None,
         description="""
         Simplified list of metrics specifically mentioned in this text block.
         Used to link the 'Argument' to the 'Proof'.
@@ -179,7 +204,15 @@ class FinancialTableItem(BaseDocItem):
     Captures the rigorous accounting reality of the grid.
     """
     type: Literal["financial_table"] = "financial_table"
-    
+
+    # Fine-grained citation bboxes (per-cell)
+    value_bboxes: Optional[Dict[str, List[List[float]]]] = Field(
+        default=None,
+        description="""Per-cell bounding boxes for fine-grained citation highlighting.
+        Keys: cell text. Values: list of [bbox_x, bbox_y, bbox_w, bbox_h] (0-1 normalized).
+        Multiple bboxes per key handle duplicate values across columns."""
+    )
+
     # Representation
     html_repr: str = Field(
         ...,
@@ -228,7 +261,16 @@ class VisualItem(BaseDocItem):
     Wraps the output of the Vision Tool.
     """
     type: Literal["visual"] = "visual"
-    
+
+    # Fine-grained citation bboxes (per-value, per-series-label)
+    value_bboxes: Optional[Dict[str, List[List[float]]]] = Field(
+        default=None,
+        description="""Per-value bounding boxes for fine-grained citation highlighting.
+        Keys: normalized float strings for numbers, series labels for legends.
+        Values: list of [bbox_x, bbox_y, bbox_w, bbox_h] (0-1 normalized).
+        Multiple bboxes per key handle duplicate values."""
+    )
+
     archetype: VisualArchetype = Field(
         ...,
         description="""
@@ -265,7 +307,15 @@ class ChartTableItem(BaseDocItem):
     A hybrid artifact that is visually a chart but structurally a table.
     """
     type: Literal["chart_table"] = "chart_table"
-    
+
+    # Fine-grained citation bboxes (per-value, per-series-label)
+    value_bboxes: Optional[Dict[str, List[List[float]]]] = Field(
+        default=None,
+        description="""Per-value bounding boxes for fine-grained citation highlighting.
+        Keys: normalized float strings for numbers, series labels for legends.
+        Values: list of [bbox_x, bbox_y, bbox_w, bbox_h] (0-1 normalized)."""
+    )
+
     archetype: VisualArchetype = Field(
         ...,
         description="""

@@ -1,176 +1,465 @@
-# CENTAUR: High-Fidelity Underwriting RAG
+# CENTAUR
 
-**Status:** Alpha (Ingestion Engine Active)
-**Core Philosophy:** The "Centaur" Architecture (Local Body / Cloud Brain)
-**Python:** 3.11+ | **Stack:** Docker, Postgres, Qdrant, LangGraph
+**Financial Document Intelligence Platform**
 
-> **🚀 Key Differentiator:** Centaur is the first open-source RAG engine specifically engineered to solve **"Semantic Collapse"** in monochromatic financial charts (e.g., Pitchbooks, Earnings Slides) using relative luminance physics.
+Centaur is a full-stack RAG engine purpose-built for high-finance document analysis. It ingests complex financial documents (CIMs, earnings slides, lender presentations, financial models), extracts structured data from charts and tables with forensic precision, and serves it through a cited conversational interface where every claim links back to its source.
 
----
-
-## 🏛️ Executive Summary
-
-**Centaur** is a specialized Retrieval-Augmented Generation (RAG) engine designed for **Private Credit Underwriting**. Unlike generic chat bots, Centaur treats credit agreements, indentures, and financial models as structured databases, not unstructured text.
-
-The system is engineered to solve the **"Trust Gap"** in financial AI by enforcing three non-negotiable standards:
-1.  **Pixel-Perfect Grounding:** Every generated answer must point to verifiable coordinates (visual or native) in the source document.
-2.  **Audit-Ready Arithmetic:** The LLM is strictly forbidden from performing mental math. All calculations are executed via Python tools on extracted tabular data.
-3.  **Cost Discipline ("The Token Firewall"):** We maximize the use of local hardware (OCR, Layout Analysis, Embedding) to minimize API costs, sending only high-value reasoning tasks to the cloud.
+**Python 3.11+** | **Next.js 15** | **Docker** | **Postgres** | **Qdrant** | **LangGraph**
 
 ---
 
-## 🏗️ System Architecture
+## What Makes This Different
 
-Centaur operates on a hybrid "Body/Brain" model to balance cost and precision.
+Most RAG systems treat documents as flat text. Financial documents aren't flat text — they're dense visual artifacts where a single stacked bar chart encodes more information than three pages of prose. Centaur solves this with three architectural decisions:
 
-### 1. The Dual-Helix Ingestion Pipeline
-We reject the "one-size-fits-all" ingestion approach. Files are routed based on their semantic structure.
+1. **Two-Phase Visual Pipeline (Glance + Read).** A layout analyzer detects chart regions and their archetypes (Cartesian, Waterfall, Valuation Field). A forensic vision extractor then reads each region with full context — axis labels, legends, footnotes, annotations — producing typed `MetricSeries` with per-datapoint provenance.
 
-```mermaid
-graph TD
-    User[User Upload] --> Router{Smart Router}
-    
-    %% Helix A: Visual Stream
-    Router -- PDF / Scan --> Docling[Body: IBM Docling v2]
-    Docling -->|Visual Layout| Layouts[Artifact: JSON Layouts]
-    Docling -->|Clean Markdown| Text[Vector Indexing]
-    
-    %% Helix B: Native Stream
-    Router -- XLSX / PPTX --> MarkItDown[Body: MarkItDown + OpenPyXL]
-    MarkItDown -->|Logic Extraction| Tables[Artifact: Markdown Tables]
-    MarkItDown --> Phantom[Body: Phantom Renderer]
-    Phantom -->|Shadow PDF| ShadowCache[Visual: Rendered PDF]
-    
-    %% Convergence
-    Layouts & Tables & ShadowCache --> Indexer[Indexer]
-    Indexer --> Postgres[(Postgres: Lineage Ledger)]
-    Indexer --> Blobs[(Local Blob Store)]
-    Indexer --> Qdrant[(Qdrant: Vector Pointers)]
+2. **Hybrid Search with Structured Analytics.** Qualitative content (narratives, summaries, insights) lives in Qdrant as dense+sparse vectors. Quantitative content (every extracted datapoint) lives in Postgres as pre-computed `metric_facts` rows. The query router decides which path — or both — to use.
+
+3. **Pixel-Precise Citations.** Every generated answer carries `[N]` citation markers. Each resolves to a `Citation` object with source file, page number, and normalized bounding box coordinates. The frontend renders these as clickable highlight overlays on the actual document page.
+
+---
+
+## Architecture
+
+```
+                                    CENTAUR
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                                                                 │
+    │   INGESTION (Write Path)                                        │
+    │   ┌──────────┐    ┌──────────────┐    ┌────────────────────┐   │
+    │   │  Smart    │───>│  Dual-Helix  │───>│  Unified Document  │   │
+    │   │  Router   │    │  Parsers     │    │  (Typed Stream)    │   │
+    │   └──────────┘    │              │    └────────┬───────────┘   │
+    │                    │  Helix A:    │             │               │
+    │                    │  PDF/Visual  │        ┌────┴────┐         │
+    │                    │  (Docling +  │        │         │         │
+    │                    │   VLM x2)    │        ▼         ▼         │
+    │                    │              │   ┌────────┐ ┌────────┐    │
+    │                    │  Helix B:    │   │ Qdrant │ │Postgres│    │
+    │                    │  Native      │   │ Hybrid │ │ Metric │    │
+    │                    │  (Excel)     │   │ Index  │ │ Facts  │    │
+    │                    └──────────────┘   └────────┘ └────────┘    │
+    │                                           │           │        │
+    │   RETRIEVAL (Read Path)                   │           │        │
+    │   ┌──────────┐    ┌──────────────┐   ┌────┴───────────┴───┐   │
+    │   │  Query   │───>│  Term        │──>│  Hybrid Search     │   │
+    │   │  Router  │    │  Injector    │   │  (Dense + BM25)    │   │
+    │   │  (LLM)   │    │  (Multilin.) │   │  + Voyage Rerank   │   │
+    │   └──────────┘    └──────────────┘   │  + Text-to-SQL     │   │
+    │        │                              └─────────┬─────────┘   │
+    │        │                                        │              │
+    │   GENERATION                                    │              │
+    │   ┌──────────────────────────────────────┐     │              │
+    │   │  GPT-4.1 Generation                   │<────┘              │
+    │   │  + Citation Sidecar                   │                    │
+    │   │  + Citation Verification              │                    │
+    │   └──────────────┬───────────────────────┘                    │
+    │                  │                                             │
+    └──────────────────┼─────────────────────────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   FastAPI  ──>  SSE Stream  ──>  Next.js UI                    │
+    │                                  ┌─────┬────────┬──────┐       │
+    │                                  │Docs │ PDF    │ Chat │       │
+    │                                  │List │ Viewer │Panel │       │
+    │                                  │     │ +BBox  │ +Cite│       │
+    │                                  └─────┴────────┴──────┘       │
+    └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 2. The Storage Layer: "The Three Truths"
-To prevent "Metadata Bloat" in the Vector DB and ensure data integrity, Centaur decouples storage into three distinct layers.
+---
 
-| Layer | Component | Role | Why? |
-| :--- | :--- | :--- | :--- |
-| **State Truth** | **PostgreSQL** | **Lineage Ledger**. Tracks document status (Draft vs. Final) and effective dates. | Prevents "Hallucinating Old Data" by filtering superseded drafts. |
-| **Content Truth** | **Local Blobs** | **Artifact Store**. Stores heavy `layouts/*.json` and `tables/*.md`. | Keeps the Vector DB lightweight. Allows index rebuilding without re-ingesting. |
-| **Search Truth** | **Qdrant** | **Pointer Index**. Stores embeddings and `chunk_id` references only. | Optimized purely for speed and semantic retrieval. |
+## The Ingestion Pipeline
 
-### 3. The Reasoning Engine (Lexical Graph)
-We utilize a **Lexical Graph** approach rather than "Semantic Hops" to solve the specific complexity of Credit Agreements.
-* **Term Injection:** A Regex-driven pass extracts "Article I: Definitions" and injects them only when relevant.
-* **The Phantom DOM:** For native files (Excel), the system cites a "Shadow PDF" generated by Playwright, allowing pixel-perfect citations on spreadsheet cells.
+Documents enter through the **Smart Router** which classifies by file type and routes to the appropriate parser.
+
+### Helix A: Visual Documents (PDF)
+
+The core differentiator. A two-phase VLM pipeline orchestrated by `pdf_parser.py`:
+
+**Phase 1 — Glance (Layout Analysis).** GPT-4.1-mini performs object detection on each page, producing `ChartRegion` objects with bounding boxes (0-1000 integer grid), visual archetypes (Cartesian, Waterfall, Table, ValuationField, MarketMap), axis labels, legends, and annotation texts.
+
+**Phase 2 — Read (Forensic Extraction).** GPT-4.1-mini receives the page image plus a "Scout Dossier" assembled from Phase 1 (OCR text sorted by position, layout hints, Column Manifests for waterfalls). It produces typed `MetricSeries` — each containing labeled `DataPoint` objects with currency, magnitude, measure, periodicity, and anti-hallucination `original_text` fields.
+
+**Parallel: Docling.** IBM Docling v2 runs concurrently for table extraction, producing `FinancialTableItem` objects with HTML representation and row hierarchy (indentation depth for accounting bridges like Net Income to EBITDA).
+
+**Post-Extraction Validators.** Deterministic Python code (not LLM) runs after extraction:
+- Stacked Total Guard — prevents nonsensical sums across side-by-side charts
+- Summary Consistency Check — verifies summary claims against extracted metrics
+- Category Validation — ensures insight categories match the 5-way taxonomy
+- Split-Brain Table Guard — skips VLM table extraction when Docling already succeeded
+
+### Helix B: Native Documents (Excel, PPTX)
+
+MarkItDown + OpenPyXL extract structured data. Playwright generates a "Shadow PDF" for visual citation on spreadsheet cells.
+
+### Output: UnifiedDocument
+
+Both helices produce a `UnifiedDocument` — a typed stream of discriminated union items:
+
+| Item Type | Content | Downstream Use |
+|-----------|---------|----------------|
+| `HeaderItem` | Section titles with hierarchy level | Document structure, retrieval context |
+| `NarrativeItem` | Qualitative text with sentiment and category | Semantic search, insight retrieval |
+| `FinancialTableItem` | HTML table with row hierarchy and accounting basis | Table search, Docling-sourced structured data |
+| `VisualItem` | Chart title, summary, and `MetricSeries[]` | Numeric search, analytics, citations |
+| `ChartTableItem` | Hybrid chart-table artifacts (Football Fields) | Dual-mode retrieval |
 
 ---
 
-## 🧠 Deep Dive: The Visual Cortex (v1.1)
+## The Indexing Pipeline
 
-*New in v1.1:* Centaur utilizes a production-grade **Financial Vision Pipeline** designed to solve "Semantic Collapse" in monochromatic charts (e.g., Google Earnings, Pitchbooks).
+Each `UnifiedDocument` is indexed into two stores simultaneously:
 
-#### A. The Universal Classifier (Heuristic Filtering)
-Before processing a region, we classify it using a 4-Variable Orthogonal Model:
-1.  **Alpha-Token Ratio:** Filters out prose ($>80\%$ text).
-2.  **Entity Density:** Scans for financial markers ($, %, x, EBITDA) and industry units (MW, sq ft, TEU).
-3.  **Geometric Alignment:** Uses dynamic clustering gaps to detect grids and "Key-Value" structures (Rent Rolls).
-4.  **Guardrails:** Detects and penalizes "Table of Contents" (dots + numbers) and Legal Disclaimers.
+### Qdrant (Semantic Search)
 
-#### B. The Vector Radar & Spatial Index
-To bind text labels to data bars without hallucination, we implemented a physics engine:
-* **Spatial Hashing:** Divides the page into grid buckets, reducing lookup complexity from $O(N^2)$ to $O(1)$ on complex diagrams.
-* **Edge-to-Edge Physics:** Calculates distance from the *edge* of a shape, not the center. This fixes data loss on wide bar charts.
-* **The "Periscope" Probe:** Allows the search radius to expand outside the visual bounding box to find Legends located in the slide header/footer.
+The **Document Chunker** (`chunker.py`) flattens items into `IndexableChunk` objects with type-specific strategies:
 
-#### C. Relative Luminance Resolution (The "Google" Fix)
-LLMs fail when a chart uses "Brand Red" (`#EA4335`) vs "Dark Red" (`#A61C00`). They see both as "Red."
-* **The Fix:** Centaur converts absolute Hex codes into **Relative Semantic Names** using HSL Math.
-* **Output:** Instead of `Legend: Red`, the LLM receives `Legend: Luminance-73 Red (Light)` vs `Legend: Luminance-40 Red (Dark)`. This creates a deterministic link between the legend key and the data bar.
+- **VisualItem** — one summary chunk (`"{title}. {summary}. Series: {labels}"`) + one chunk per MetricSeries with full data representation
+- **FinancialTableItem** — markdown-converted table summary
+- **NarrativeItem** — raw text with category and sentiment metadata
+- **HeaderItem** — header text with hierarchy level
 
-#### D. Hybrid OCR Safety Net (The "Raster Fallback")
-Financial decks often contain "Zombie Charts"—Excel screenshots pasted as flat images.
-* **Layer 1 (Vector):** We first probe the PDF's internal structure. If text objects exist, we use them (100% accuracy).
-* **Layer 2 (Raster):** If a region contains `< 5` vector text items, the system automatically triggers **RapidOCR (ONNX)**.
+Each chunk is embedded via **Cohere embed-v4** (1024 dims, multilingual, 100+ languages) and indexed with both dense vectors and **Qdrant native BM25** sparse vectors. Search uses **Reciprocal Rank Fusion (RRF)** to combine both signals.
 
-#### E. Context-Aware Semantic Binding (The "Logic Split")
-Standard RAG parsers treat all text equally. Centaur differentiates based on content type:
-* **Legend Mode (Text):** Activates a **"Periscope Search"**, looking for colored keys *adjacent* to the text.
-* **Data Mode (Numeric):** Activates **"Background Detection"**, identifying the color directly *underneath* or geometrically closest to the number.
-* **The Result:** Prevents the system from confusing a value (e.g., "$20m") with a category definition.
+### Postgres (Structured Analytics)
+
+The **Analytics Driver** (`analytics_driver.py`) flattens every `DataPoint` from every `MetricSeries` into a `metric_facts` row:
+
+```sql
+series_label, numeric_value, currency, magnitude, measure,
+resolved_value,  -- PRE-COMPUTED: numeric_value * magnitude_multiplier
+period_date,     -- PRE-PARSED from label text
+accounting_basis, data_provenance, periodicity, archetype
+```
+
+`resolved_value` is computed deterministically in Python at ingestion time (never by the LLM). This means a Text-to-SQL query like "revenue > $1B" translates to `WHERE resolved_value > 1000000000` — no magnitude CASE statements, no LLM math.
 
 ---
 
-## 🛡️ Engineering Standards (Strict Enforcement)
+## The Retrieval Pipeline
 
-### 1. The "Token Firewall"
-* **Rule:** Never send raw chunks to the LLM without stripping visual noise.
-* **Implementation:** Headers, footers, and decorative artifacts are stripped locally before embedding.
+### Query Router
 
-### 2. Auditability & Citations
-* **Rule:** Every answer must return a `Citation` object.
-* **Implementation:** Use the `src.schemas.citation.Citation` model. Citations must map to the `shadow_cache` for visualization.
+An LLM classifier routes each query to the optimal retrieval strategy:
 
-### 3. No Mental Math
-* **Rule:** If the user asks for a calculation (e.g., "Leverage Ratio"), the Agent **MUST** use the `calculator` tool.
-* **Implementation:** Python handles the math; the LLM handles the logic.
+| Route | Strategy | Example |
+|-------|----------|---------|
+| **Qualitative** | Qdrant hybrid search only | "What are the key investment risks?" |
+| **Quantitative** | Text-to-SQL over `metric_facts` + light vector search | "What was EBITDA in Q3 2024?" |
+| **Hybrid** | Both paths, merged | "Why did revenue decline in Q3?" |
 
-### 4. Asynchronous Purity
-* **Rule:** No blocking operations on the main event loop.
-* **Implementation:** All CPU-bound tasks (OCR, Image Processing) must be offloaded to `ThreadPoolExecutor` to ensure high concurrency.
+### Multilingual Query Expansion
+
+The **Term Injector** solves the cross-lingual BM25 gap. German "Umsatz" won't match English "Revenue" in sparse search. Before search:
+1. An LLM expands the query with multilingual synonyms and abbreviations
+2. Known series labels from Postgres are fuzzy-matched and appended
+
+The expanded query feeds the BM25 sparse leg. The original query feeds the dense embedding leg.
+
+### Reranking
+
+After RRF fusion, results pass through **Voyage Rerank 2.5** — a cross-encoder that re-scores each chunk against the original query for precision. Optional — the system works without it if no Voyage API key is configured.
 
 ---
 
-## 📂 Repository Map
+## The Generation Pipeline
 
-```text
+### Citation Sidecar
+
+Retrieved chunks are mapped to ephemeral IDs `[1]`, `[2]`, etc. and formatted as XML source blocks for the generation LLM:
+
+```xml
+<source id="[1]" file="deal_memo.pdf p.12" type="visual">
+Revenue grew 15% YoY driven by APAC expansion...
+</source>
+```
+
+### Answer Generation
+
+GPT-4.1 generates answers with mandatory `[N]` citation markers. The system prompt enforces: respond in the query's language, cite every factual claim, include currency/magnitude/period for numbers.
+
+### Citation Verification
+
+A lightweight LLM pass checks that each cited source actually supports the claim made. Unsupported citations are dropped before the response reaches the user.
+
+### Citation Resolution
+
+`[N]` markers in the generated text are resolved to `Citation` objects containing:
+- `source_file` — original filename
+- `page_number` — 1-based page
+- `blurb` — the source text snippet
+- `bbox` — normalized 0-1 bounding box for frontend highlighting
+
+---
+
+## The Visual Cortex
+
+Centaur's vision pipeline solves problems that standard RAG parsers cannot handle:
+
+### Relative Luminance Resolution
+LLMs fail when a chart uses "Brand Red" (`#EA4335`) vs "Dark Red" (`#A61C00`). They see both as "Red." Centaur converts absolute hex codes into **Relative Semantic Names** using HSL math, giving the VLM `Luminance-73 Red (Light)` vs `Luminance-40 Red (Dark)`.
+
+### Hybrid OCR Safety Net
+Financial decks contain "Zombie Charts" — Excel screenshots pasted as flat images. The system first probes the PDF's internal vector structure. If a region has fewer than 5 vector text items, it triggers **RapidOCR (ONNX)** automatically.
+
+### Column Manifest Builder
+For waterfalls and grouped bar charts, the system builds a spatial manifest of column positions using OCR X-coordinates, enabling precise data-to-label binding without hallucination.
+
+### Anti-Hallucination Guards
+- **Forced Chain of Thought:** The `audit_log` field makes the VLM analyze chart structure (units, legends, anomalies, math checks) before extracting any numbers
+- **Soft-Fail Validators:** `BeforeValidator` hooks convert messy financial strings ("N/A", "($50.2)", "1,200") to clean floats or None — never crash the pipeline
+- **Math Verification:** Waterfall sums, stacked totals, and pie percentages are checked in the audit log
+
+---
+
+## The Frontend
+
+A three-panel Next.js application:
+
+| Panel | Component | Function |
+|-------|-----------|----------|
+| **Left Sidebar** | `DocumentList` | Upload PDFs, browse ingested documents |
+| **Center** | `DocumentViewer` | PDF.js page renderer with bbox highlight overlays |
+| **Right** | `ChatPanel` | Conversational interface with clickable `[N]` citation badges |
+
+Clicking a citation badge in the chat highlights the corresponding region on the document page. Coordinates scale from normalized 0-1 values to pixel positions: `left = bbox.x * containerWidth`.
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Role |
+|-------|-----------|------|
+| **VLM** | GPT-4.1-mini | Layout analysis + visual extraction (both phases) |
+| **Generation** | GPT-4.1 | Answer synthesis with citations |
+| **Embedding** | Cohere embed-v4 | Dense vectors (1024 dims, multilingual) |
+| **Sparse Search** | Qdrant native BM25 | Exact term matching with IDF weighting |
+| **Reranking** | Voyage Rerank 2.5 | Cross-encoder precision layer (optional) |
+| **Vector DB** | Qdrant | Hybrid search with RRF fusion |
+| **SQL DB** | PostgreSQL 15 | Document ledger + `metric_facts` analytics |
+| **Table Extraction** | IBM Docling v2 | HTML table extraction with row hierarchy |
+| **OCR** | RapidOCR (ONNX) | Fallback for rasterized chart images |
+| **Orchestration** | LangGraph | Stateful query routing and generation workflow |
+| **API** | FastAPI | REST + SSE streaming endpoints |
+| **Frontend** | Next.js 15 + Tailwind | Three-panel document intelligence UI |
+| **Observability** | LangSmith | Full trace visibility on every pipeline step |
+
+---
+
+## Repository Structure
+
+```
 centaur/
-├── data/                       # [SINGLE SOURCE OF TRUTH]
-│   ├── inputs/                 # Drop zone for raw PDFs/Excel
-│   ├── system/                 # The State Truth (Dev mode hook)
-│   ├── blobs/                  # The Content Truth (Simulates Azure Blob Container)
-│   │   ├── layouts/            # JSON Coordinate Maps
-│   │   └── tables/             # Full Markdown Tables
-│   └── shadow_cache/           # The Visual Truth (Phantom PDFs)
 ├── src/
-│   ├── config.py               # Factory Pattern: Toggles OpenAI (Dev) <-> Azure (Prod)
-│   ├── ingestion/              # [LOCAL BODY] The Dual-Helix Engine
-│   │   ├── filters.py          # Token Firewall logic
-│   │   ├── native_parser.py    # MarkItDown + OpenPyXL fallback
-│   │   ├── pdf_parser.py       # Docling v2 with Visual Context Injection
-│   │   ├── phantom.py          # Playwright "Shadow PDF" generator
-│   │   ├── pipeline.py         # The Orchestrator
-│   │   └── router.py           # Smart routing (Visual vs Native)
-│   ├── retrieval/              # [SEARCH TRUTH - READ]
-│   │   ├── qdrant.py           # Search Logic (The "Brain" uses this)
-│   │   ├── sidecar.py          # Context Window Manager
-│   │   └── term_injector.py    # Regex Definitions Extractor
-│   ├── schemas/                # [TYPE SAFETY] Shared Pydantic Models
-│   │   ├── citation.py         # "Pixel-Perfect" citation object
-│   │   ├── documents.py        # Chunk definitions
-│   │   └── state.py            # LangGraph state schema
-│   ├── storage/                # [THE THREE TRUTHS - WRITE]
-│   │   ├── blob_driver.py      # Content Truth (Writes to blobs/)
-│   │   ├── db_driver.py        # State Truth (Writes to Postgres)
-│   │   └── vector_driver.py    # Search Truth (Writes to Qdrant)
-│   ├── tools/                  # [AGENT TOOLS]
-│   │   ├── calculator.py       # Python Math Engine
-│   │   ├── database.py         # SQL Lookup Tool
-│   │   └── vision.py           # GPT-4o Visual Analysis Tool
-│   ├── utils/                  # [OBSERVABILITY]
-│   │   ├── resilience.py       # Retry decorators & JSON repair
-│   │   ├── telemetry.py        # Cost tracking
-│   │   └── tracing.py          # LangSmith connection
-│   └── workflows/              # [CLOUD BRAIN] LangGraph Logic
-│       ├── graph.py            # The State Machine Controller
-│       ├── router.py           # Semantic Intent Router
-│       └── nodes/              # Discrete Reasoning Steps
-│           ├── financial_math.py
-│           └── legal_reasoning.py
-├── test/
-│   ├── benchmarks/
-│   │   └── cost_analysis.py
-│   └── units/
-├── .env
-├── docker-compose.yml
-├── README.md
-├── requirements.txt
-└── run_ingestion.py            # [TRIGGER] Manual entry point
+│   ├── config.py                          # Central config (models, keys, paths)
+│   │
+│   ├── ingestion/                         # WRITE PATH
+│   │   ├── pipeline.py                    # Orchestrator (routing -> parsing -> indexing)
+│   │   ├── router.py                      # File type classification
+│   │   ├── pdf_parser.py                  # Two-phase VLM pipeline (Glance + Read)
+│   │   ├── native_parser.py               # Excel/PPTX extraction
+│   │   ├── chunker.py                     # UnifiedDocument -> IndexableChunks
+│   │   ├── filters.py                     # Token firewall (noise stripping)
+│   │   └── phantom.py                     # Shadow PDF generation (Playwright)
+│   │
+│   ├── retrieval/                         # READ PATH
+│   │   ├── qdrant.py                      # Full pipeline (expand -> search -> rerank)
+│   │   ├── term_injector.py               # Multilingual query expansion + label matching
+│   │   └── sidecar.py                     # Citation sidecar (build -> resolve -> verify)
+│   │
+│   ├── storage/                           # DATA LAYER
+│   │   ├── vector_driver.py               # Qdrant hybrid index (Cohere + BM25 + RRF)
+│   │   ├── analytics_driver.py            # Postgres metric_facts (structured analytics)
+│   │   ├── db_driver.py                   # Postgres document ledger
+│   │   └── blob_driver.py                 # Local artifact store
+│   │
+│   ├── schemas/                           # TYPE CONTRACTS
+│   │   ├── deal_stream.py                 # UnifiedDocument, DocItem union
+│   │   ├── vision_output.py               # MetricSeries, DataPoint, Insight
+│   │   ├── layout_output.py               # ChartRegion, PageLayout, VisualArchetype
+│   │   ├── retrieval.py                   # RetrievedChunk, RetrievalResult
+│   │   ├── citation.py                    # Citation, BoundingBox (normalized 0-1)
+│   │   ├── enums.py                       # Domain taxonomy (Category, Periodicity, etc.)
+│   │   ├── state.py                       # LangGraph AgentState
+│   │   └── documents.py                   # Ingestion result types
+│   │
+│   ├── workflows/                         # LANGGRAPH BRAIN
+│   │   ├── graph.py                       # Graph assembly (route -> retrieve -> generate)
+│   │   ├── router.py                      # Query classifier (qual/quant/hybrid + locale)
+│   │   └── nodes/
+│   │       ├── retrieve.py                # Retrieval nodes (qualitative, quantitative, hybrid)
+│   │       ├── financial_math.py          # Text-to-SQL over metric_facts
+│   │       └── generate.py                # GPT-4.1 generation + citation verification
+│   │
+│   ├── api/                               # FASTAPI SERVER
+│   │   ├── main.py                        # App setup, CORS, startup initialization
+│   │   ├── schemas.py                     # Request/response models
+│   │   └── routes/
+│   │       ├── chat.py                    # POST /chat, POST /chat/stream (SSE)
+│   │       ├── ingestion.py               # POST /ingest, GET /documents
+│   │       └── documents.py               # Page image rendering, region overlays
+│   │
+│   └── tools/                             # VLM TOOLS
+│       ├── layout_analyzer.py             # Phase 1: Object detection (Glance)
+│       ├── visual_extractor.py            # Phase 2: Forensic extraction (Read)
+│       ├── calculator.py                  # Python math engine
+│       ├── database.py                    # SQL lookup tool
+│       └── vision.py                      # GPT-4o visual analysis
+│
+├── frontend/                              # NEXT.JS UI
+│   └── src/
+│       ├── app/
+│       │   ├── layout.tsx                 # Root layout
+│       │   ├── page.tsx                   # Three-panel app shell
+│       │   └── globals.css                # Dark theme, bbox overlay styles
+│       ├── components/
+│       │   ├── ChatPanel.tsx              # Chat with clickable citation badges
+│       │   ├── DocumentViewer.tsx         # PDF.js viewer with bbox overlays
+│       │   ├── DocumentList.tsx           # Sidebar with upload
+│       │   └── BboxOverlay.tsx            # Pixel-precise citation highlight
+│       └── lib/
+│           └── api.ts                     # API client
+│
+├── data/                                  # DATA LAKE (gitignored)
+│   ├── inputs/                            # Raw document drop zone
+│   ├── blobs/                             # Extracted artifacts
+│   ├── shadow_cache/                      # Rendered shadow PDFs
+│   ├── qdrant_storage/                    # Qdrant data volume
+│   └── postgres_data/                     # Postgres data volume
+│
+├── docker-compose.yml                     # Qdrant + Postgres
+├── requirements.txt                       # Python dependencies
+├── run_ingestion.py                       # Manual ingestion entry point
+└── .env                                   # API keys and config
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.11+
+- Node.js 24+ (LTS)
+- Docker Desktop
+
+### 1. Start Infrastructure
+
+```bash
+docker-compose up -d
+```
+
+This starts Qdrant (port 6333) and Postgres (port 5432).
+
+### 2. Configure Environment
+
+Add your API keys to `.env`:
+
+```env
+OPENAI_API_KEY=sk-...          # Required — GPT-4.1 for VLM + generation
+COHERE_API_KEY=...             # Required — embed-v4 for vector search
+VOYAGE_API_KEY=...             # Optional — rerank-2.5 for precision
+```
+
+Where to get keys:
+- **OpenAI:** [platform.openai.com](https://platform.openai.com)
+- **Cohere:** [dashboard.cohere.com](https://dashboard.cohere.com) — free tier: 1,000 calls/month, no credit card
+- **Voyage AI:** [dash.voyageai.com](https://dash.voyageai.com) — free tier: 200M tokens
+
+### 3. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+```bash
+cd frontend
+npm install
+```
+
+### 4. Run
+
+Terminal 1 — Backend:
+```bash
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Terminal 2 — Frontend:
+```bash
+cd frontend
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+### 5. Ingest a Document
+
+Upload a PDF through the UI, or run manually:
+
+```bash
+python run_ingestion.py
+```
+
+---
+
+## Domain Taxonomy
+
+All extracted insights are classified into five categories:
+
+| Category | Definition | Example |
+|----------|-----------|---------|
+| **Financial** | Ledger facts — P&L, BS, CF line items. Includes bridge/variance drivers. | "EBIT fell due to volume/pricing headwinds" |
+| **Operational** | Non-ledger business KPIs | "Headcount grew 12% YoY" |
+| **Market** | Industry structure, TAM, competitive dynamics | "European market CAGR of 4.2%" |
+| **Strategic** | Corporate decisions by management or shareholders | "Acquired XYZ in 2023 for platform expansion" |
+| **Transactional** | Deal terms, financing, covenants, returns | "Senior secured at 5.5x leverage" |
+
+---
+
+## Engineering Standards
+
+1. **No Mental Math.** The LLM never performs arithmetic. All calculations use `resolved_value` (pre-computed in Python) or the calculator tool.
+
+2. **Mandatory Citations.** Every generated factual claim must carry a `[N]` marker that resolves to a verifiable source location.
+
+3. **Token Firewall.** Headers, footers, and decorative artifacts are stripped before embedding to prevent noise in the vector index.
+
+4. **Async Purity.** No blocking operations on the main event loop. CPU-bound tasks (OCR, image processing) are offloaded to thread pools.
+
+5. **Separation of Concerns.** The VLM captures raw visual data. Python handles all transformations, normalization, and calculations. This minimizes hallucination and maximizes auditability.
+
+---
+
+## Observability
+
+Every pipeline step is traced via **LangSmith** under the `Chiron_Adv_RAG` project:
+
+```env
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=lsv2_...
+LANGCHAIN_PROJECT=Chiron_Adv_RAG
+```
+
+Traced functions: layout analysis, visual extraction, document chunking, embedding, hybrid search, query expansion, reranking, Text-to-SQL, answer generation, citation verification.
+
+---
+
+## Data Privacy and Azure Deployment
+
+Centaur is designed for sensitive financial data. For production with real deal data:
+
+- **Cohere embed-v4** is available on [Azure AI Foundry](https://docs.cohere.com/docs/cohere-on-azure/cohere-on-azure-ai-foundry) — runs inside your Azure tenant
+- **Voyage Rerank 2.5** is available on [Azure Marketplace](https://docs.voyageai.com/docs/azure-marketplace-mongodb-voyage) — data never leaves your VNet
+- **OpenAI** is available as Azure OpenAI Service with the same data sovereignty guarantees
+- **Qdrant** and **Postgres** run locally — no data leaves your machine
+
+Switching from public APIs to Azure-hosted instances is a config change, not an architectural change.
+
+---
+
+## License
+
+Proprietary. Internal use only.

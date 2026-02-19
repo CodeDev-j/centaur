@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd /c \"conda run -n centaur python -c \"\"import fitz; doc = fitz.open\\(''data/inputs/mercedes-benz-ir-capitalmarketpresentation-fy-2024-10.pdf''\\); page = doc[0]; page.get_pixmap\\(dpi=150\\).save\\(''data/inputs/page10_preview.png''\\); print\\(''saved''\\)\"\"\")",
+      "Bash(python -c:*)",
+      "Bash(where:*)",
+      "Bash(ls:*)",
+      "Bash(pip install:*)"
+    ]
+  }
+}

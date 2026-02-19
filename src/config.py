@@ -59,11 +59,31 @@ class SystemConfig:
     """
     DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "OPENAI_DEV")
 
-    # --- Model Selection ---
+    # --- Model Selection (role-based: change the value, not the name) ---
+    # Ingestion VLM: layout detection + forensic chart extraction.
     LAYOUT_MODEL = os.getenv("LAYOUT_MODEL_NAME", "gpt-4.1-mini")
     VISION_MODEL = os.getenv("VISION_MODEL_NAME", "gpt-4.1-mini")
-    REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4.1")
-    EMBEDDING_MODEL = "fastembed"  # Explicit definition
+    # Structured reasoning: Text-to-SQL, query routing, citation verification.
+    # 4.1-mini handles this well — output is constrained (SQL, classification).
+    REASONING_MODEL = os.getenv("REASONING_MODEL_NAME", "gpt-4.1-mini")
+    # Answer synthesis: the user-facing generation step. Needs nuance and fluency.
+    GENERATION_MODEL = os.getenv("GENERATION_MODEL_NAME", "gpt-4.1")
+
+    # --- Embedding & Reranking ---
+    COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+    VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+    # Cohere embed-v4.0: 1536 is the model's native output dimension.
+    # Multilingual (100+ languages). Free tier: 1,000 calls/month.
+    # Azure Marketplace deployment available for production data sovereignty.
+    EMBEDDING_MODEL = "embed-v4.0"
+    EMBEDDING_DIMS = 1536
+    # Voyage Rerank 2.5: cross-encoder precision layer. Optional — the system
+    # gracefully skips reranking if VOYAGE_API_KEY is not set.
+    RERANK_MODEL = "rerank-2.5"
+
+    # --- API Server ---
+    API_HOST = os.getenv("API_HOST", "0.0.0.0")
+    API_PORT = int(os.getenv("API_PORT", "8000"))
 
     # --- Infrastructure (REQUIRED for Docker connection) ---
     POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")

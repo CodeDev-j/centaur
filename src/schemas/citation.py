@@ -55,4 +55,5 @@ class Citation(BaseModel):
     page_number: int
     blurb: str = Field(..., description="The specific text snippet quoted")
     bbox: Optional[BoundingBox] = None
+    doc_hash: str = Field("", description="Document hash for viewer navigation")
     native_id: Optional[str] = Field(None, description="Excel Cell ID (e.g., 'C15')")

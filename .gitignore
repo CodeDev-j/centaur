@@ -72,3 +72,8 @@ celerybeat-schedule
 
 # --- Jupyter ---
 .ipynb_checkpoints
+
+# --- Frontend ---
+frontend/node_modules/
+frontend/.next/
+frontend/out/

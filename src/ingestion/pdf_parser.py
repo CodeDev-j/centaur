@@ -35,9 +35,10 @@ import base64
 import hashlib
 import io
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, List, Tuple, Dict, get_args
+from typing import Any, Dict, List, Optional, Tuple, get_args
 from uuid import uuid4
 
 # --- Third-Party Imports ---
@@ -109,6 +110,278 @@ RENDER_ZOOM = 3.0
 # Heuristics for linking text labels to color boxes in legends.
 LEGEND_SEARCH_RADIUS = (-30, -5, 30, 5)  # (x0, y0, x1, y1) expansion box
 LEGEND_DISTANCE_THRESHOLD = 25  # Pixels
+
+# ==============================================================================
+# 📐 BBOX CONVERSION HELPER
+# ==============================================================================
+
+def _chart_bbox_to_normalized(bbox: List[int]) -> dict:
+    """
+    Converts ChartRegion's 0-1000 integer grid bbox to normalized 0-1 kwargs
+    suitable for SourceRef.
+
+    ChartRegion format: [ymin, xmin, ymax, xmax] (0-1000)
+    SourceRef format:   bbox_x, bbox_y, bbox_width, bbox_height (0.0-1.0)
+    """
+    ymin, xmin, ymax, xmax = bbox
+    return {
+        "bbox_x": xmin / 1000.0,
+        "bbox_y": ymin / 1000.0,
+        "bbox_width": (xmax - xmin) / 1000.0,
+        "bbox_height": (ymax - ymin) / 1000.0,
+    }
+
+
+def _docling_bbox_to_normalized(item, pdf_doc: fitz.Document) -> dict:
+    """
+    Extracts normalized 0-1 bbox from a Docling item's provenance data.
+    Returns empty dict if provenance is unavailable.
+
+    Docling BoundingBox: l, t, r, b in PDF points (default TOPLEFT origin).
+    Normalizes against fitz page dimensions to produce SourceRef kwargs.
+    """
+    if not item.prov:
+        return {}
+
+    prov = item.prov[0]
+    bbox = prov.bbox
+    if not bbox:
+        return {}
+
+    page_no = prov.page_no
+    if page_no < 1 or page_no > len(pdf_doc):
+        return {}
+
+    page = pdf_doc[page_no - 1]
+    pw, ph = page.rect.width, page.rect.height
+    if pw == 0 or ph == 0:
+        return {}
+
+    # Docling defaults to TOPLEFT origin. Handle BOTTOMLEFT if present.
+    if hasattr(bbox, "coord_origin") and bbox.coord_origin.value == "BOTTOMLEFT":
+        bbox = bbox.to_top_left_origin(ph)
+
+    return {
+        "bbox_x": bbox.l / pw,
+        "bbox_y": bbox.t / ph,
+        "bbox_width": bbox.width / pw,
+        "bbox_height": bbox.height / ph,
+    }
+
+
+# ==============================================================================
+# 🔢 VALUE-TO-BBOX SPATIAL BINDING
+# ==============================================================================
+
+def _normalize_financial_str(s: str) -> Optional[float]:
+    """Strip $, commas, %, superscripts from a string and return as float."""
+    clean = re.sub(r'[^\d.\-]', '', s)
+    try:
+        return float(clean) if clean and clean != '.' and clean != '-' else None
+    except ValueError:
+        return None
+
+
+def _word_inside_region(word: Dict, rx: float, ry: float, rw: float, rh: float) -> bool:
+    """Check if a word record's center falls inside a normalized 0-1 region."""
+    cx = word["bbox_x"] + word["bbox_w"] / 2
+    cy = word["bbox_y"] + word["bbox_h"] / 2
+    return rx <= cx <= rx + rw and ry <= cy <= ry + rh
+
+
+def _build_value_bboxes(
+    metrics: List[Any],
+    word_bboxes: List[Dict],
+    chart_regions: List[Any],
+) -> Optional[Dict[str, List[List[float]]]]:
+    """
+    Matches VLM-extracted MetricSeries values against OCR word bboxes
+    to build a per-value spatial dictionary.
+
+    Keys are normalized float strings for numbers (e.g., "8090.0") and
+    verbatim series_label strings for labels. Values are lists of
+    [bbox_x, bbox_y, bbox_w, bbox_h] in 0-1 normalized coordinates.
+    Multiple bboxes per key handle duplicate values on the page.
+
+    OCR words are filtered to those inside ChartRegion bboxes to prevent
+    false matches from footnotes or adjacent charts.
+    """
+    if not metrics or not word_bboxes:
+        return None
+
+    result: Dict[str, List[List[float]]] = {}
+
+    # Build per-region filtered word lists
+    region_words: List[List[Dict]] = []
+    for chart in chart_regions:
+        ymin, xmin, ymax, xmax = chart.bbox
+        rx, ry = xmin / 1000.0, ymin / 1000.0
+        rw, rh = (xmax - xmin) / 1000.0, (ymax - ymin) / 1000.0
+        filtered = [w for w in word_bboxes if _word_inside_region(w, rx, ry, rw, rh)]
+        region_words.append(filtered)
+
+    # Fall back to all words if no chart regions
+    all_region_words = []
+    for rw_list in region_words:
+        all_region_words.extend(rw_list)
+    search_words = all_region_words if all_region_words else word_bboxes
+
+    for series in metrics:
+        # A. Match series_label (multi-word AABB union)
+        label = series.series_label
+        label_tokens = label.split()
+        if label_tokens:
+            matched_bboxes = []
+            remaining = list(search_words)
+            for token in label_tokens:
+                token_lower = token.lower().rstrip('*†')
+                for w in remaining:
+                    if w["text"].lower().rstrip('*†') == token_lower:
+                        matched_bboxes.append(w)
+                        remaining.remove(w)
+                        break
+
+            if matched_bboxes:
+                # AABB union of all matched words
+                x0 = min(w["bbox_x"] for w in matched_bboxes)
+                y0 = min(w["bbox_y"] for w in matched_bboxes)
+                x1 = max(w["bbox_x"] + w["bbox_w"] for w in matched_bboxes)
+                y1 = max(w["bbox_y"] + w["bbox_h"] for w in matched_bboxes)
+                result.setdefault(label, []).append([x0, y0, x1 - x0, y1 - y0])
+
+        # B. Match data point numeric values
+        for dp in series.data_points:
+            if dp.numeric_value is None:
+                continue
+
+            target_float = float(dp.numeric_value)
+            key = str(target_float)
+
+            # Try matching against OCR words in relevant regions
+            for w in search_words:
+                ocr_float = _normalize_financial_str(w["text"])
+                if ocr_float is not None and abs(ocr_float - target_float) < 0.01:
+                    bbox = [w["bbox_x"], w["bbox_y"], w["bbox_w"], w["bbox_h"]]
+                    # Avoid duplicate bboxes for the same key
+                    existing = result.get(key, [])
+                    if not any(
+                        abs(b[0] - bbox[0]) < 0.005 and abs(b[1] - bbox[1]) < 0.005
+                        for b in existing
+                    ):
+                        result.setdefault(key, []).append(bbox)
+
+    return result if result else None
+
+
+def _build_sentence_bboxes(
+    text: str,
+    page: fitz.Page,
+    item_bbox: dict,
+) -> Optional[Dict[str, List[List[float]]]]:
+    """
+    Builds per-sentence, per-line bounding boxes for narrative text.
+
+    Splits text into sentences using nltk (handles "Inc.", "U.S.", etc.),
+    matches each sentence's words against PyMuPDF's digital text layer,
+    and groups matched words by visual line (block_no, line_no) to produce
+    per-line AABB rectangles. This prevents multi-line sentences from
+    creating a single oversized highlight box.
+
+    Args:
+        text: The narrative text content.
+        page: The fitz.Page for word extraction.
+        item_bbox: Normalized 0-1 bbox dict (bbox_x, bbox_y, etc.) to filter words.
+
+    Returns:
+        Dict mapping sentence text to list of [bbox_x, bbox_y, bbox_w, bbox_h].
+        None if no sentences could be matched.
+    """
+    from nltk.tokenize import sent_tokenize
+
+    if not text or len(text) < 10:
+        return None
+
+    pw, ph = page.rect.width, page.rect.height
+    if pw == 0 or ph == 0:
+        return None
+
+    # Get all digital text words with line grouping info
+    raw_words = page.get_text("words")
+    page_words = []
+    for w in raw_words:
+        rec = {
+            "text": w[4],
+            "bbox_x": w[0] / pw, "bbox_y": w[1] / ph,
+            "bbox_w": (w[2] - w[0]) / pw, "bbox_h": (w[3] - w[1]) / ph,
+            "block_no": int(w[5]), "line_no": int(w[6]),
+        }
+        # Filter to words within the item's bbox region (if available)
+        if item_bbox and "bbox_x" in item_bbox:
+            cx = rec["bbox_x"] + rec["bbox_w"] / 2
+            cy = rec["bbox_y"] + rec["bbox_h"] / 2
+            bx = item_bbox["bbox_x"]
+            by = item_bbox["bbox_y"]
+            bw = item_bbox.get("bbox_width", 1.0)
+            bh = item_bbox.get("bbox_height", 1.0)
+            if not (bx <= cx <= bx + bw and by <= cy <= by + bh):
+                continue
+        page_words.append(rec)
+
+    if not page_words:
+        return None
+
+    # Split into sentences
+    sentences = sent_tokenize(text)
+    result: Dict[str, List[List[float]]] = {}
+
+    # Track consumed word index for greedy sequential matching
+    word_cursor = 0
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        sent_tokens = sentence.split()
+        matched_words = []
+
+        # Greedy sequential match against page words
+        local_cursor = word_cursor
+        for token in sent_tokens:
+            token_clean = token.lower().rstrip('.,;:!?')
+            while local_cursor < len(page_words):
+                pw_text = page_words[local_cursor]["text"].lower().rstrip('.,;:!?')
+                if pw_text == token_clean or pw_text.startswith(token_clean):
+                    matched_words.append(page_words[local_cursor])
+                    local_cursor += 1
+                    break
+                local_cursor += 1
+
+        if not matched_words:
+            continue
+
+        # Advance cursor past matched words for next sentence
+        word_cursor = local_cursor
+
+        # Group by visual line (block_no, line_no) and compute per-line AABB
+        line_groups: Dict[Tuple[int, int], List[Dict]] = {}
+        for mw in matched_words:
+            line_key = (mw["block_no"], mw["line_no"])
+            line_groups.setdefault(line_key, []).append(mw)
+
+        line_bboxes = []
+        for words_in_line in line_groups.values():
+            x0 = min(w["bbox_x"] for w in words_in_line)
+            y0 = min(w["bbox_y"] for w in words_in_line)
+            x1 = max(w["bbox_x"] + w["bbox_w"] for w in words_in_line)
+            y1 = max(w["bbox_y"] + w["bbox_h"] for w in words_in_line)
+            line_bboxes.append([x0, y0, x1 - x0, y1 - y0])
+
+        if line_bboxes:
+            result.setdefault(sentence, []).extend(line_bboxes)
+
+    return result if result else None
+
 
 # ==============================================================================
 # 📄 PDF PARSER
@@ -240,15 +513,21 @@ class PDFParser:
         page: fitz.Page,
         img_np: np.ndarray,
         zoom_factor: float
-    ) -> str:
+    ) -> Tuple[str, List[Dict]]:
         """
         Generates a 'Spatial Grid' representation of the page text.
         Strategy:
         1. Extract Digital Text (Ground Truth) from the PDF layer.
         2. Run OCR (Visual Fill) to catch 'Zombie Text' embedded in images.
         3. Merge results, discarding OCR duplicates that overlap digital text.
+
+        Returns:
+            spatial_string: Text grid for VLM context (unchanged format).
+            word_records: Per-word bboxes normalized 0-1 for value_bboxes binding.
         """
         spatial_lines = []
+        word_records: List[Dict] = []
+        pw, ph = page.rect.width, page.rect.height
 
         # --- LAYER 1: DIGITAL TEXT (Ground Truth) ---
         # Returns: (x0, y0, x1, y1, "word", block_no, line_no, word_no)
@@ -265,6 +544,15 @@ class PDFParser:
             x_img = int(w[0] * zoom_factor)
             y_img = int(w[1] * zoom_factor)
             spatial_lines.append(f"[{y_img}, {x_img}] {w[4]}")
+
+            # Structured word record (normalized 0-1)
+            if pw > 0 and ph > 0:
+                word_records.append({
+                    "text": w[4],
+                    "bbox_x": w[0] / pw, "bbox_y": w[1] / ph,
+                    "bbox_w": (w[2] - w[0]) / pw, "bbox_h": (w[3] - w[1]) / ph,
+                    "block_no": int(w[5]), "line_no": int(w[6]),
+                })
 
         # --- LAYER 2: OCR FILL (The Safety Net) ---
         # We run OCR to catch text embedded in images (Zombie Charts)
@@ -312,20 +600,34 @@ class PDFParser:
                         spatial_lines.append(
                             f"[{int(y1_img)}, {int(x1_img)}] {text}"
                         )
+                        # Structured word record (normalized 0-1)
+                        if pw > 0 and ph > 0:
+                            word_records.append({
+                                "text": text,
+                                "bbox_x": x1_pdf / pw, "bbox_y": y1_pdf / ph,
+                                "bbox_w": (x2_pdf - x1_pdf) / pw,
+                                "bbox_h": (y2_pdf - y1_pdf) / ph,
+                                "block_no": -1, "line_no": -1,
+                            })
 
         except Exception as e:
             logger.warning(f"⚠️ OCR Layer failed: {e}")
 
-        # Sort spatially: Top-down, then Left-right
+        # Sort spatially: Left-right (column order), then Top-down within each column.
+        # X-first ensures chart values appear in column order regardless of whether
+        # bar labels sit above (positive bars) or below (negative bars) the axis.
+        # Y-first (reading order) caused column-shift errors on waterfalls: positive
+        # bar labels float high (low Y) and were greedily assigned to wrong columns
+        # before the negative bar labels (high Y) were reached.
         def parse_sort_key(line):
             try:
                 coords = line.split("]")[0].strip("[").split(",")
-                return int(coords[0]), int(coords[1])
+                return int(coords[1]), int(coords[0])  # (X, Y)
             except Exception:
                 return (0, 0)
 
         spatial_lines.sort(key=parse_sort_key)
-        return "\n".join(spatial_lines)
+        return "\n".join(spatial_lines), word_records
 
     def _generate_vector_hints(
         self,
@@ -426,7 +728,9 @@ class PDFParser:
         item,
         doc,
         doc_hash: str,
-        filename: str
+        filename: str,
+        bbox_kwargs: dict = None,
+        pdf_doc: fitz.Document = None
     ) -> List[DocItem]:
         """
         Handles high-fidelity table extraction via Docling.
@@ -442,6 +746,22 @@ class PDFParser:
         await BlobDriver.save_json({"html": html_content}, "tables", f"{chunk_id}.json")
 
         page_no = item.prov[0].page_no if item.prov else 1
+
+        # Extract per-cell bboxes from Docling's internal table structure
+        cell_bboxes: Dict[str, List[List[float]]] = {}
+        if pdf_doc and hasattr(item, 'data') and hasattr(item.data, 'table_cells'):
+            page_obj = pdf_doc[page_no - 1]
+            pw, ph = page_obj.rect.width, page_obj.rect.height
+            if pw > 0 and ph > 0:
+                for cell in item.data.table_cells:
+                    if cell.bbox and cell.text.strip():
+                        cb = cell.bbox
+                        if hasattr(cb, "coord_origin") and cb.coord_origin.value == "BOTTOMLEFT":
+                            cb = cb.to_top_left_origin(ph)
+                        key = cell.text.strip()
+                        cell_bboxes.setdefault(key, []).append([
+                            cb.l / pw, cb.t / ph, cb.width / pw, cb.height / ph
+                        ])
         
         # Merge Headers and Footnotes for Metadata Detection
         headers = " ".join([str(c) for c in df.columns])
@@ -473,7 +793,12 @@ class PDFParser:
         try:
             return [FinancialTableItem(
                 id=chunk_id,
-                source=SourceRef(file_hash=doc_hash, page_number=page_no),
+                source=SourceRef(
+                    file_hash=doc_hash,
+                    page_number=page_no,
+                    **(bbox_kwargs or {})
+                ),
+                value_bboxes=cell_bboxes or None,
                 html_repr=html_content,
                 rows=rows,
                 accounting_basis=meta.get("accounting_basis"),
@@ -529,43 +854,48 @@ class PDFParser:
         )
         local_items.extend(resolved_tables)
 
+        # [Fix 3] Skip VLM for pages with no non-TABLE chart regions.
+        # Title slides, text-only pages, and pure-table pages are handled by Docling.
+        non_table_charts = [
+            c for c in layout.charts
+            if c.visual_type != VisualArchetype.TABLE
+        ]
+        if not non_table_charts:
+            return local_items, local_quarantine, signals
+
         # 4. Build Context (OCR + Vector Hints)
-        ocr_context = await self._extract_text_spatial(page, np.array(pil_img), zoom)
+        ocr_context, word_bboxes = await self._extract_text_spatial(page, np.array(pil_img), zoom)
         vector_hints = self._generate_vector_hints(page, layout=layout)
         full_context = f"[OCR SPATIAL GRID]\n{ocr_context}\n\n[VECTOR LEGEND HINTS]\n{vector_hints}"
 
         # 5. Visual Extraction (The "Read")
         analysis = await visual_extractor.analyze_full_page(img_bytes, full_context, layout)
 
+        # 6. Build value-level bboxes by matching VLM metrics to OCR words
+        vb = _build_value_bboxes(analysis.metrics, word_bboxes, layout.charts) if analysis else None
+
         if analysis:
             eid = str(uuid4())
 
-            # A. Process Summary (Narrative)
-            # Wrap in try/except to prevent page crash on validation error
-            try:
-                local_items.append(NarrativeItem(
-                    id=str(uuid4()), 
-                    layout_cluster_id=eid,
-                    source=SourceRef(file_hash=doc_hash, page_number=page_num),
-                    text_content=analysis.summary, 
-                    is_strategic_claim=True
-                ))
-            except ValidationError as e:
-                local_quarantine.append({
-                    "type": "summary", "error": str(e), "page": page_num
-                })
+            # [Fix 4] Summary is already on VisualItem.summary — no separate
+            # NarrativeItem needed. Eliminates duplication and incorrect
+            # is_strategic_claim=True on factual data summaries.
 
-            # B. Process Insights (Narrative)
-            # Wrap iteration in try/except
+            # A. Process Insights (Narrative)
             for insight in analysis.insights:
                 try:
                     local_items.append(NarrativeItem(
-                        id=str(uuid4()), 
+                        id=str(uuid4()),
                         layout_cluster_id=eid,
                         source=SourceRef(file_hash=doc_hash, page_number=page_num),
-                        text_content=insight.content, 
-                        sentiment=insight.sentiment_direction,
-                        is_strategic_claim=(insight.category == "Strategic")
+                        text_content=insight.content,
+                        sentiment=(
+                            "Positive" if insight.stated_direction == "positive_contributor"
+                            else "Negative" if insight.stated_direction == "negative_contributor"
+                            else "Unknown"
+                        ),
+                        is_strategic_claim=(insight.category == "Strategic"),
+                        category=insight.category  # [Fix 6c] Propagate full taxonomy
                     ))
                 except ValidationError as e:
                     local_quarantine.append({
@@ -573,54 +903,108 @@ class PDFParser:
                         "content": insight.model_dump()
                     })
 
-            # C. Process Charts & Visuals
+            # B. Process Charts & Visuals
             if layout.charts:
-                for chart in layout.charts:
-                    # Filter metrics by Region ID.
-                    # Ensures "Revenue" metrics don't bleed into the "Margin" chart.
-                    chart_metrics = [
-                        m for m in analysis.metrics 
-                        if m.source_region_id == chart.region_id or m.source_region_id is None
-                    ]
+                # [Fix 2] Check if VLM assigned region IDs to metrics.
+                # When all metrics are untagged and multiple charts exist,
+                # emit a single VisualItem to prevent duplication.
+                all_untagged = (
+                    all(m.source_region_id is None for m in analysis.metrics)
+                    if analysis.metrics else True
+                )
 
+                if all_untagged and len(layout.charts) > 1:
+                    # VLM didn't partition by region — emit single VisualItem
+                    primary = layout.charts[0]
                     try:
-                        # Differentiate between Standard Visuals and "Chart-Tables"
-                        if chart.visual_type == VisualArchetype.VALUATION_FIELD:
-                            local_items.append(ChartTableItem(
-                                id=str(uuid4()), 
-                                layout_cluster_id=eid,
-                                source=SourceRef(
-                                    file_hash=doc_hash, 
-                                    page_number=page_num, 
-                                    layout_id=str(chart.region_id)
-                                ),
-                                archetype=chart.visual_type, 
-                                title=chart.title, 
-                                visual_metrics=chart_metrics
-                            ))
-                            signals.has_valuation_models = True
-                        else:
-                            local_items.append(VisualItem(
-                                id=str(uuid4()), 
-                                layout_cluster_id=eid,
-                                source=SourceRef(
-                                    file_hash=doc_hash, 
-                                    page_number=page_num, 
-                                    layout_id=str(chart.region_id)
-                                ),
-                                archetype=chart.visual_type, 
-                                title=chart.title, 
-                                summary=analysis.summary, 
-                                metrics=chart_metrics
-                            ))
-                        
-                        if chart.visual_type == VisualArchetype.WATERFALL:
-                            signals.has_valuation_models = True
-                            
+                        local_items.append(VisualItem(
+                            id=str(uuid4()),
+                            layout_cluster_id=eid,
+                            source=SourceRef(
+                                file_hash=doc_hash,
+                                page_number=page_num,
+                                layout_id=str(primary.region_id),
+                                **_chart_bbox_to_normalized(primary.bbox)
+                            ),
+                            archetype=primary.visual_type,
+                            title=(
+                                analysis.title
+                                if analysis.title and analysis.title.lower() != "untitled"
+                                else primary.title or analysis.title
+                            ),
+                            summary=analysis.summary,
+                            metrics=analysis.metrics,
+                            value_bboxes=vb
+                        ))
                     except ValidationError as e:
                         local_quarantine.append({
-                            "type": "chart", "error": str(e), "bbox": chart.bbox
+                            "type": "chart", "error": str(e),
+                            "bbox": primary.bbox
                         })
+
+                    # Propagate routing signals from all charts
+                    for chart in layout.charts:
+                        if chart.visual_type in (VisualArchetype.WATERFALL, VisualArchetype.VALUATION_FIELD):
+                            signals.has_valuation_models = True
+                else:
+                    for chart in layout.charts:
+                        # [Fix 5] Skip TABLE charts when Docling already captured the data.
+                        if chart.visual_type == VisualArchetype.TABLE:
+                            has_docling_table = any(
+                                isinstance(t, FinancialTableItem)
+                                for t in resolved_tables
+                            )
+                            if has_docling_table:
+                                continue
+
+                        # Filter metrics by Region ID.
+                        chart_metrics = [
+                            m for m in analysis.metrics
+                            if m.source_region_id == chart.region_id or m.source_region_id is None
+                        ]
+
+                        try:
+                            bbox_kwargs = _chart_bbox_to_normalized(chart.bbox)
+                            if chart.visual_type == VisualArchetype.VALUATION_FIELD:
+                                local_items.append(ChartTableItem(
+                                    id=str(uuid4()),
+                                    layout_cluster_id=eid,
+                                    source=SourceRef(
+                                        file_hash=doc_hash,
+                                        page_number=page_num,
+                                        layout_id=str(chart.region_id),
+                                        **bbox_kwargs
+                                    ),
+                                    archetype=chart.visual_type,
+                                    title=chart.title,
+                                    visual_metrics=chart_metrics,
+                                    value_bboxes=vb
+                                ))
+                                signals.has_valuation_models = True
+                            else:
+                                local_items.append(VisualItem(
+                                    id=str(uuid4()),
+                                    layout_cluster_id=eid,
+                                    source=SourceRef(
+                                        file_hash=doc_hash,
+                                        page_number=page_num,
+                                        layout_id=str(chart.region_id),
+                                        **bbox_kwargs
+                                    ),
+                                    archetype=chart.visual_type,
+                                    title=chart.title,
+                                    summary=analysis.summary,
+                                    metrics=chart_metrics,
+                                    value_bboxes=vb
+                                ))
+
+                            if chart.visual_type == VisualArchetype.WATERFALL:
+                                signals.has_valuation_models = True
+
+                        except ValidationError as e:
+                            local_quarantine.append({
+                                "type": "chart", "error": str(e), "bbox": chart.bbox
+                            })
 
         return local_items, local_quarantine, signals
 
@@ -644,48 +1028,55 @@ class PDFParser:
         doc_id = str(uuid4())
         master_signals = RoutingSignals()
 
-        # --- STEP 1: DOCLING (Logical Structure) ---
-        # Run in executor to avoid blocking the event loop with CPU work
-        loop = asyncio.get_running_loop()
-        docling_res = await loop.run_in_executor(
-            None, self.converter.convert, file_path
-        )
-
-        page_table_items = {}
-        # Extract ALL content types (Tables, Headers, Text)
-        for item, _ in docling_res.document.iterate_items():
-            p_no = item.prov[0].page_no if item.prov else 1
-
-            if isinstance(item, TableItem):
-                new_t = await self._process_complex_table(
-                    item, docling_res.document, doc_hash, file_path.name
-                )
-                page_table_items.setdefault(p_no, []).extend(new_t)
-            
-            elif isinstance(item, SectionHeaderItem) and item.text.strip():
-                valid_items.append(HeaderItem(
-                    id=str(uuid4()), 
-                    source=SourceRef(file_hash=doc_hash, page_number=p_no),
-                    text=item.text.strip(), 
-                    level=getattr(item, 'level', 1)
-                ))
-            
-            elif isinstance(item, (TextItem, ListItem)) and len(item.text.strip()) > 15:
-                # Basic noise filter (>15 chars) to avoid page numbers/artifacts
-                valid_items.append(NarrativeItem(
-                    id=str(uuid4()), 
-                    source=SourceRef(file_hash=doc_hash, page_number=p_no),
-                    text_content=item.text.strip()
-                ))
-
-        # --- STEP 2: VLM (Visual Intelligence) ---
-        # Concurrency Control via Semaphore
-        sem = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
-        tasks = []
-
-        # Ensure file handle is closed even if the loop crashes
+        # Open fitz doc early — used for both Docling bbox normalization and VLM
         pdf_doc = fitz.open(file_path)
         try:
+
+            # --- STEP 1: DOCLING (Logical Structure) ---
+            # Run in executor to avoid blocking the event loop with CPU work
+            loop = asyncio.get_running_loop()
+            docling_res = await loop.run_in_executor(
+                None, self.converter.convert, file_path
+            )
+
+            page_table_items = {}
+            # Extract ALL content types (Tables, Headers, Text)
+            for item, _ in docling_res.document.iterate_items():
+                p_no = item.prov[0].page_no if item.prov else 1
+                bbox_kw = _docling_bbox_to_normalized(item, pdf_doc)
+
+                if isinstance(item, TableItem):
+                    new_t = await self._process_complex_table(
+                        item, docling_res.document, doc_hash, file_path.name,
+                        bbox_kwargs=bbox_kw, pdf_doc=pdf_doc
+                    )
+                    page_table_items.setdefault(p_no, []).extend(new_t)
+
+                elif isinstance(item, SectionHeaderItem) and item.text.strip():
+                    valid_items.append(HeaderItem(
+                        id=str(uuid4()),
+                        source=SourceRef(file_hash=doc_hash, page_number=p_no, **bbox_kw),
+                        text=item.text.strip(),
+                        level=getattr(item, 'level', 1)
+                    ))
+
+                elif isinstance(item, (TextItem, ListItem)) and len(item.text.strip()) > 15:
+                    # Basic noise filter (>15 chars) to avoid page numbers/artifacts
+                    narr_text = item.text.strip()
+                    sentence_bboxes = _build_sentence_bboxes(
+                        narr_text, pdf_doc[p_no - 1], bbox_kw
+                    )
+                    valid_items.append(NarrativeItem(
+                        id=str(uuid4()),
+                        source=SourceRef(file_hash=doc_hash, page_number=p_no, **bbox_kw),
+                        text_content=narr_text,
+                        value_bboxes=sentence_bboxes
+                    ))
+
+            # --- STEP 2: VLM (Visual Intelligence) ---
+            # Concurrency Control via Semaphore
+            sem = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
+            tasks = []
             total_pages = len(pdf_doc)
 
             async def protected_process(p):

@@ -32,6 +32,8 @@ from src.schemas.documents import IngestionResult
 from src.schemas.deal_stream import UnifiedDocument  # The Contract
 from src.storage.db_driver import ledger_db, DocumentLedger
 from src.storage.vector_driver import VectorDriver
+from src.storage.analytics_driver import AnalyticsDriver
+from src.ingestion.chunker import flatten_document
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ class IngestionPipeline:
         self.pdf_parser = pdf_parser
         self.native_parser = NativeParser()
         self.indexer = VectorDriver()
+        self.analytics = AnalyticsDriver()
         
     @traceable(name="Run Ingestion Pipeline", run_type="chain")
     async def run(self, file_path: Path) -> Union[UnifiedDocument, IngestionResult]:
@@ -111,9 +114,15 @@ class IngestionPipeline:
             
             # 3. Indexing (The Search Truth)
             # ------------------------------------------------------------------
-            # We push clean chunks to Qdrant so the Brain can find them.
-            # logger.info("🧠 Generating Embeddings & Indexing...")
-            # self.indexer.index(doc.items) 
+            # 3a. Vector index: flatten items → chunks → Qdrant (dense + sparse)
+            logger.info("Generating embeddings & indexing to Qdrant...")
+            chunks = flatten_document(doc)
+            if chunks:
+                await self.indexer.index(chunks)
+
+            # 3b. Analytics index: flatten MetricSeries → Postgres metric_facts
+            logger.info("Indexing metric facts to Postgres...")
+            self.analytics.index_metrics(doc)
             
         except Exception as e:
             logger.error(f"💥 Pipeline crashed on {file_path.name}: {e}")

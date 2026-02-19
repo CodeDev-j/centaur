@@ -217,6 +217,27 @@ class ChartRegion(BaseModel):
         """
     )
 
+    # --- QUALITATIVE ANNOTATIONS ---
+    annotation_texts: List[str] = Field(
+        default_factory=list,
+        description="""
+        Qualitative text callouts, floating labels, or commentary boxes found
+        INSIDE or immediately adjacent to the chart area. These are NOT numeric
+        values, axis labels, legend keys, or titles.
+
+        EXAMPLES: "Operational efficiencies outweighing one-time supplier payments",
+        "Global Financial Crisis", "New product launch driving growth".
+
+        DETECTION RULE: Capture text that:
+        - Floats inside the chart area disconnected from any bar/axis
+        - Appears in a callout box or annotation bubble
+        - Forms a bulleted commentary list next to the chart
+
+        These will be converted to `insights` by the downstream vision extractor.
+        If none are present, return an empty list [].
+        """
+    )
+
     # --- DEAL SPECIFIC (Non-Standard) ---
     detected_entities: List[VisualEntity] = Field(
         default_factory=list,
