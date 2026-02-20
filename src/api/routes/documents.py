@@ -4,20 +4,22 @@ Document Routes: Serve document pages, region overlays, and chunk inspection.
 GET /api/v1/documents/{hash}/pdf                    — Raw PDF for react-pdf
 GET /api/v1/documents/{hash}/page/{n}/image         — Rendered page image (PyMuPDF)
 GET /api/v1/documents/{hash}/page/{n}/regions       — Bbox overlays (stub)
-GET /api/v1/documents/{hash}/page/{n}/chunks        — All chunks for inspection
+GET /api/v1/documents/{hash}/page/{n}/chunks        — All chunks for a page
+GET /api/v1/documents/{hash}/chunks                 — All chunks for a document (filtered)
 GET /api/v1/documents/{hash}/stats                  — Document-level chunk counts
 """
 
 import io
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from src.api.schemas import (
     ChunkDetail,
+    DocChunksResponse,
     DocStatsResponse,
     PageChunksResponse,
     RegionOverlay,
@@ -98,9 +100,10 @@ def _point_to_chunk(point) -> ChunkDetail:
             "height": float(p["bbox_height"]),
         }
 
-    # Count value_bboxes entries, then strip from metadata
+    # Extract value_bboxes (Dict[str, List[List[float]]]) for fine-grained highlighting
     vb = p.get("value_bboxes")
-    vb_count = len(vb) if isinstance(vb, dict) else 0
+    vb_dict = vb if isinstance(vb, dict) else None
+    vb_count = len(vb_dict) if vb_dict else 0
 
     # Everything not in _CORE_FIELDS is type-specific metadata
     metadata = {k: v for k, v in p.items() if k not in _CORE_FIELDS}
@@ -111,9 +114,11 @@ def _point_to_chunk(point) -> ChunkDetail:
         item_type=p.get("item_type", "unknown"),
         chunk_text=p.get("chunk_text", ""),
         chunk_role=p.get("chunk_role"),
+        page_number=p.get("page_number", 0),
         bbox=bbox,
         metadata=metadata,
         value_bboxes_count=vb_count,
+        value_bboxes=vb_dict,
     )
 
 
@@ -204,6 +209,29 @@ async def get_page_chunks(doc_hash: str, page_number: int):
     return PageChunksResponse(
         doc_hash=doc_hash,
         page_number=page_number,
+        total_chunks=len(chunks),
+        chunks=chunks,
+    )
+
+
+@router.get("/{doc_hash}/chunks", response_model=DocChunksResponse)
+async def get_doc_chunks(
+    doc_hash: str,
+    item_type: Optional[str] = Query(None, description="Filter by item_type (e.g. visual)"),
+    chunk_role: Optional[str] = Query(None, description="Filter by chunk_role (e.g. series)"),
+):
+    """
+    Returns all indexed chunks for a document, optionally filtered.
+    Used by: Metric Explorer (item_type=visual&chunk_role=series), TSV export (no filter).
+    """
+    vd = _get_vector_driver()
+    points = vd.scroll_by_doc(doc_hash, item_type=item_type, chunk_role=chunk_role)
+
+    chunks = [_point_to_chunk(pt) for pt in points]
+    chunks.sort(key=_chunk_sort_key)
+
+    return DocChunksResponse(
+        doc_hash=doc_hash,
         total_chunks=len(chunks),
         chunks=chunks,
     )

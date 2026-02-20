@@ -8,16 +8,37 @@ import { useDocStore } from "@/stores/useDocStore";
 import { useViewerStore } from "@/stores/useViewerStore";
 import { useChatStore } from "@/stores/useChatStore";
 import { useInspectStore } from "@/stores/useInspectStore";
-import { fetchPageChunks, fetchDocStats } from "@/lib/api";
+import { fetchPageChunks, fetchDocChunks, fetchDocStats } from "@/lib/api";
+import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 
 export default function Home() {
+  useKeyboardShortcuts();
   const selectedDocHash = useDocStore((s) => s.selectedDocHash);
   const currentPage = useViewerStore((s) => s.currentPage);
   const sidebarCollapsed = useViewerStore((s) => s.sidebarCollapsed);
-  const inspectMode = useInspectStore((s) => s.inspectMode);
+  const rightPanelTab = useInspectStore((s) => s.rightPanelTab);
+  const inspectMode = rightPanelTab === "inspect";
 
   // ---------------------------------------------------------------------------
-  // Fetch chunks when inspect mode is active and page/document changes
+  // Auto-collapse sidebar on narrow viewports (< 1280px)
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    const mql = window.matchMedia("(max-width: 1279px)");
+
+    const handleChange = (e: MediaQueryListEvent | MediaQueryList) => {
+      const isNarrow = e.matches;
+      if (isNarrow && !useViewerStore.getState().sidebarManualOverride) {
+        useViewerStore.getState().setSidebarCollapsed(true);
+      }
+    };
+
+    handleChange(mql);
+    mql.addEventListener("change", handleChange);
+    return () => mql.removeEventListener("change", handleChange);
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Fetch chunks when inspect tab is active and page/document changes
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!inspectMode || !selectedDocHash) return;
@@ -44,6 +65,38 @@ export default function Home() {
   }, [inspectMode, selectedDocHash, currentPage]);
 
   // ---------------------------------------------------------------------------
+  // Fetch explorer data when explore tab is active and document changes
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (rightPanelTab !== "explore" || !selectedDocHash) return;
+
+    let cancelled = false;
+    useInspectStore.getState().setExplorerLoading(true);
+
+    Promise.all([
+      fetchDocChunks(selectedDocHash, { item_type: "visual", chunk_role: "series" }),
+      fetchDocChunks(selectedDocHash, { item_type: "visual", chunk_role: "summary" }),
+    ])
+      .then(([seriesData, summaryData]) => {
+        if (!cancelled) {
+          useInspectStore.getState().setExplorerChunks(seriesData.chunks);
+          useInspectStore.getState().setExplorerSummaryChunks(summaryData.chunks);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          useInspectStore.getState().setExplorerChunks(null);
+          useInspectStore.getState().setExplorerSummaryChunks(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) useInspectStore.getState().setExplorerLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [rightPanelTab, selectedDocHash]);
+
+  // ---------------------------------------------------------------------------
   // Fetch document stats when document changes
   // ---------------------------------------------------------------------------
   useEffect(() => {
@@ -57,7 +110,8 @@ export default function Home() {
   }, [selectedDocHash]);
 
   // ---------------------------------------------------------------------------
-  // Compute chunk highlight bbox for DocumentViewer
+  // Compute chunk highlight bboxes for DocumentViewer
+  // Fine-grained value_bboxes when available, coarse bbox as fallback
   // ---------------------------------------------------------------------------
   const activeChunkId = useInspectStore((s) => s.activeChunkId);
   const inspectChunks = useInspectStore((s) => s.inspectChunks);
@@ -65,10 +119,20 @@ export default function Home() {
     inspectMode && activeChunkId
       ? inspectChunks?.find((c) => c.chunk_id === activeChunkId) ?? null
       : null;
-  const highlightBbox =
-    inspectMode && activeChunk?.bbox ? activeChunk.bbox : null;
 
-  // Citation overlay (only when not in inspect mode)
+  let highlightBboxes: { x: number; y: number; width: number; height: number }[] | null = null;
+  if (inspectMode && activeChunk) {
+    const vb = activeChunk.value_bboxes;
+    if (vb && Object.keys(vb).length > 0) {
+      highlightBboxes = Object.values(vb).flatMap((rects) =>
+        rects.map(([x, y, width, height]) => ({ x, y, width, height }))
+      );
+    } else if (activeChunk.bbox) {
+      highlightBboxes = [activeChunk.bbox];
+    }
+  }
+
+  // Citation overlay (only when on chat tab)
   const activeCitationIndex = useChatStore((s) => s.activeCitationIndex);
   const citations = useChatStore((s) => s.citations);
 
@@ -76,19 +140,19 @@ export default function Home() {
     <div className="app-shell h-screen flex">
       {/* Left sidebar: Document list */}
       <div
-        className={`border-r border-[var(--border)] bg-[var(--bg-secondary)] shrink-0 transition-all duration-200 ${
+        className={`panel-left border-r border-[var(--border)] bg-[var(--bg-secondary)] shrink-0 transition-all duration-200 ${
           sidebarCollapsed ? "w-0 overflow-hidden" : "w-64"
         }`}
       >
         <DocumentList />
       </div>
 
-      {/* Center: Document viewer */}
-      <div className="flex-1 min-w-0 bg-[var(--bg-secondary)]">
+      {/* Center: Document viewer (desk — deepest Z-layer) */}
+      <div className="panel-center flex-1 min-w-0 bg-[var(--bg-desk)]">
         <DocumentViewer
-          highlightBbox={highlightBbox}
+          highlightBboxes={highlightBboxes}
           activeCitation={
-            !inspectMode &&
+            rightPanelTab === "chat" &&
             activeCitationIndex !== null &&
             activeCitationIndex < citations.length &&
             citations[activeCitationIndex]?.bbox?.page_number === currentPage
@@ -98,8 +162,8 @@ export default function Home() {
         />
       </div>
 
-      {/* Right panel: Chat + Inspect tabs */}
-      <div className="w-96 border-l border-[var(--border)] bg-[var(--bg-secondary)] shrink-0">
+      {/* Right panel: Chat + Inspect + Explorer tabs */}
+      <div className="panel-right w-96 border-l border-[var(--border)] bg-[var(--bg-secondary)] shrink-0">
         <RightPanel />
       </div>
     </div>

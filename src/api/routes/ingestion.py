@@ -27,6 +27,16 @@ from src.storage.db_driver import ledger_db, DocumentLedger
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["ingestion"])
 
+# ---------------------------------------------------------------------------
+# Upload validation
+# ---------------------------------------------------------------------------
+_ALLOWED_EXTENSIONS = {
+    ".pdf", ".png", ".jpg", ".jpeg",          # Visual stream
+    ".xlsx", ".xls", ".xlsm", ".csv",         # Native stream
+    ".docx", ".pptx", ".md", ".txt",          # Native stream
+}
+_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+
 # Module-level pipeline reference — set by main.py
 _pipeline = None
 
@@ -44,7 +54,12 @@ def set_pipeline(pipeline):
 class _IngestionTracker:
     status: str = "processing"
     error: Optional[str] = None
+    phase: str = "starting"       # Current phase: parsing, indexing, etc.
+    progress: str = ""            # Human-readable progress e.g. "Page 3 of 29"
+    items_count: int = 0          # Total items extracted
+    quarantine_count: int = 0     # Items that failed to parse
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    updated: asyncio.Event = field(default_factory=asyncio.Event)  # Fires on progress change
 
 
 _trackers: Dict[str, _IngestionTracker] = {}
@@ -60,7 +75,29 @@ async def _run_ingestion_background(file_path: Path, doc_hash: str):
     tracker = _trackers.get(doc_hash)
 
     try:
-        await _pipeline.run(file_path)
+        # Progress callback — updates tracker and signals SSE listeners
+        def on_progress(phase: str, detail: str):
+            if tracker:
+                tracker.phase = phase
+                tracker.progress = detail
+                tracker.updated.set()
+                tracker.updated = asyncio.Event()  # Reset for next update
+
+        result = await _pipeline.run(file_path, on_progress=on_progress)
+
+        # Check if pipeline returned an IngestionResult (internal failure)
+        # vs a UnifiedDocument (success)
+        from src.schemas.documents import IngestionResult
+        from src.schemas.deal_stream import UnifiedDocument
+        if isinstance(result, IngestionResult) and result.status != "completed":
+            raise RuntimeError(
+                f"Pipeline returned {result.status}: {result.error_msg or 'unknown error'}"
+            )
+
+        # Surface quarantine stats
+        if tracker and isinstance(result, UnifiedDocument):
+            tracker.items_count = len(result.items)
+            tracker.quarantine_count = len(result.quarantined_items) if result.quarantined_items else 0
 
         # Ensure ledger status is "completed"
         if ledger_db:
@@ -74,7 +111,14 @@ async def _run_ingestion_background(file_path: Path, doc_hash: str):
         logger.info(f"Background ingestion completed: {file_path.name}")
 
     except Exception as e:
-        logger.error(f"Background ingestion failed for {file_path.name}: {e}")
+        logger.error(f"Background ingestion failed for {file_path.name}: {e}", exc_info=True)
+
+        # Clean up partial vectors so failed docs don't leave orphaned data
+        try:
+            await _pipeline.indexer.delete_by_doc_hash(doc_hash)
+            logger.info(f"Cleaned up partial vectors for failed doc: {doc_hash[:12]}...")
+        except Exception as cleanup_err:
+            logger.warning(f"Vector cleanup failed (non-critical): {cleanup_err}")
 
         if ledger_db:
             try:
@@ -116,6 +160,19 @@ async def ingest(file: UploadFile = File(...), force: bool = False):
     """
     if _pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
+
+    # 0. Validate file type and size at the boundary
+    ext = Path(file.filename).suffix.lower() if file.filename else ""
+    if ext not in _ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(_ALLOWED_EXTENSIONS))}",
+        )
+    if file.size and file.size > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({file.size / 1024 / 1024:.0f} MB). Max: {_MAX_UPLOAD_BYTES // 1024 // 1024} MB",
+        )
 
     # 1. Save uploaded file to inputs directory
     dest = SystemPaths.INPUTS / file.filename
@@ -210,21 +267,33 @@ async def ingest_status_stream(doc_hash: str):
             yield f"data: {json.dumps({'status': tracker.status, 'error': tracker.error})}\n\n"
             return
 
-        # Still processing — wait with heartbeats
-        yield f"data: {json.dumps({'status': 'processing'})}\n\n"
+        # Still processing — stream progress updates and heartbeats
+        yield f"data: {json.dumps({'status': 'processing', 'phase': tracker.phase, 'progress': tracker.progress})}\n\n"
 
         while not tracker.done.is_set():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(tracker.done.wait()),
-                    timeout=15,
-                )
-            except asyncio.TimeoutError:
-                # Heartbeat: SSE comment line (colon prefix), not a data event
+            # Wait for either: done, progress update, or 15s heartbeat
+            done_task = asyncio.create_task(asyncio.shield(tracker.done.wait()))
+            update_task = asyncio.create_task(asyncio.shield(tracker.updated.wait()))
+            finished, pending = await asyncio.wait(
+                {done_task, update_task},
+                timeout=15,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+
+            if tracker.done.is_set():
+                break
+
+            if finished:
+                # Progress update — send current phase/detail
+                yield f"data: {json.dumps({'status': 'processing', 'phase': tracker.phase, 'progress': tracker.progress})}\n\n"
+            else:
+                # Timeout — heartbeat
                 yield ": heartbeat\n\n"
 
-        # Final status
-        yield f"data: {json.dumps({'status': tracker.status, 'error': tracker.error})}\n\n"
+        # Final status with summary stats
+        yield f"data: {json.dumps({'status': tracker.status, 'error': tracker.error, 'items_count': tracker.items_count, 'quarantine_count': tracker.quarantine_count})}\n\n"
 
     return StreamingResponse(
         event_generator(),

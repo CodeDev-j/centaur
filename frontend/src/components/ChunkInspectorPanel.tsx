@@ -1,8 +1,11 @@
 "use client";
 
+import { useState, useCallback } from "react";
+import { ClipboardCopy } from "lucide-react";
 import { useInspectStore } from "@/stores/useInspectStore";
 import { useViewerStore } from "@/stores/useViewerStore";
 import { ChunkDetail } from "@/lib/api";
+import { copyTsvToClipboard } from "@/lib/tsvExport";
 
 // Type badge colors — high contrast on dark (#141414) background
 const TYPE_COLORS: Record<string, { bg: string; text: string; label: string }> = {
@@ -152,6 +155,15 @@ export default function ChunkInspectorPanel() {
   const isLoading = useInspectStore((s) => s.inspectLoading);
   const currentPage = useViewerStore((s) => s.currentPage);
 
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+
+  const handleCopyTsv = useCallback(async () => {
+    if (!chunks || chunks.length === 0) return;
+    const ok = await copyTsvToClipboard(chunks);
+    setCopyFeedback(ok ? "Copied!" : "Failed");
+    setTimeout(() => setCopyFeedback(null), 2000);
+  }, [chunks]);
+
   return (
     <div className="flex flex-col h-full">
       <div className="px-4 py-3 border-b border-[var(--border)] space-y-1">
@@ -164,6 +176,20 @@ export default function ChunkInspectorPanel() {
               </span>
             )}
           </h3>
+          {chunks && chunks.length > 0 && (
+            <button
+              onClick={handleCopyTsv}
+              className="p-1 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] relative"
+              title="Copy page chunks as TSV (Ctrl+Shift+C)"
+            >
+              <ClipboardCopy size={14} />
+              {copyFeedback && (
+                <span className="absolute -top-6 right-0 text-[10px] bg-[var(--bg-tertiary)] border border-[var(--border)] rounded px-1.5 py-0.5 whitespace-nowrap">
+                  {copyFeedback}
+                </span>
+              )}
+            </button>
+          )}
         </div>
 
         {docStats && (

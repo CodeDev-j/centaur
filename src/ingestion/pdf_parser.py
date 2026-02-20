@@ -766,10 +766,10 @@ class PDFParser:
         # Merge Headers and Footnotes for Metadata Detection
         headers = " ".join([str(c) for c in df.columns])
         footnotes = ""
-        if hasattr(item, "captions"): 
-            footnotes += " ".join([c.text for c in item.captions or []])
-        if hasattr(item, "footnotes"): 
-            footnotes += " ".join([f.text for f in item.footnotes or []])
+        if hasattr(item, "captions"):
+            footnotes += " ".join([getattr(c, "text", str(c)) for c in item.captions or []])
+        if hasattr(item, "footnotes"):
+            footnotes += " ".join([getattr(f, "text", str(f)) for f in item.footnotes or []])
 
         # Call external utility instead of internal method
         meta = extract_table_metadata(headers, footnotes)

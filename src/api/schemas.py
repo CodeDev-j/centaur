@@ -63,15 +63,24 @@ class ChunkDetail(BaseModel):
     item_type: str
     chunk_text: str
     chunk_role: Optional[str] = None
+    page_number: int = 0
     bbox: Optional[Dict[str, float]] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     value_bboxes_count: int = 0
+    value_bboxes: Optional[Dict[str, List[List[float]]]] = None
 
 
 class PageChunksResponse(BaseModel):
     """All chunks for a specific page."""
     doc_hash: str
     page_number: int
+    total_chunks: int
+    chunks: List[ChunkDetail]
+
+
+class DocChunksResponse(BaseModel):
+    """All chunks for a document, optionally filtered."""
+    doc_hash: str
     total_chunks: int
     chunks: List[ChunkDetail]
 

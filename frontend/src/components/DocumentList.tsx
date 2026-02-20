@@ -89,6 +89,7 @@ export default function DocumentList() {
       selectDocument(hash);
       useViewerStore.getState().resetForNewDoc();
       useInspectStore.getState().resetInspect();
+      useInspectStore.getState().resetExplorer();
 
       // Auto-activate doc scope when selecting a document
       useChatStore.getState().setDocScope("selected");
@@ -135,8 +136,14 @@ export default function DocumentList() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between">
-        <h2 className="font-semibold text-sm">Documents</h2>
+      <div className="px-4 h-12 border-b border-[var(--border)] flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-2">
+          <span className="text-h1 text-[var(--text-primary)]">CENTAUR</span>
+          <span
+            className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]"
+            style={{ boxShadow: "0 0 6px var(--accent)" }}
+          />
+        </div>
         <div className="flex gap-1">
           <button
             onClick={() => {
@@ -145,6 +152,7 @@ export default function DocumentList() {
             }}
             className="p-1 rounded hover:bg-[var(--bg-tertiary)]"
             title="Refresh"
+            suppressHydrationWarning
           >
             <RefreshCw size={14} className={isLoading ? "animate-spin" : ""} />
           </button>
@@ -153,6 +161,7 @@ export default function DocumentList() {
             className="p-1 rounded hover:bg-[var(--bg-tertiary)]"
             title="Upload"
             disabled={isUploading}
+            suppressHydrationWarning
           >
             <Upload size={14} />
           </button>
@@ -163,14 +172,15 @@ export default function DocumentList() {
           accept=".pdf,.xlsx,.xls,.csv"
           onChange={handleUpload}
           className="hidden"
+          suppressHydrationWarning
         />
       </div>
 
       {/* Document list */}
       <div className="flex-1 overflow-auto">
         {documents.length === 0 && !isLoading && (
-          <div className="text-[var(--text-secondary)] text-xs text-center mt-8 px-4">
-            No documents ingested yet. Upload a PDF to get started.
+          <div className="text-caption text-[var(--text-secondary)] text-center mt-8 px-4">
+            0 Documents
           </div>
         )}
 
@@ -179,7 +189,7 @@ export default function DocumentList() {
             key={doc.doc_hash}
             onClick={() => handleSelectDocument(doc.doc_hash)}
             disabled={doc.status === "processing"}
-            className={`w-full text-left px-4 py-3 border-b border-[var(--border)] transition-colors ${
+            className={`w-full text-left px-4 py-3 border-b border-[var(--border)] transition-colors duration-100 ${
               doc.status === "processing"
                 ? "opacity-60 cursor-wait"
                 : "hover:bg-[var(--bg-tertiary)]"

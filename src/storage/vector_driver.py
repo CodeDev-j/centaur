@@ -9,6 +9,7 @@ Manages hybrid vector indexing and search in Qdrant:
 Replaces the original fastembed/bge-small-en-v1.5 driver.
 """
 
+import asyncio
 import logging
 from typing import List, Optional, Dict, Any
 from uuid import uuid4
@@ -133,22 +134,51 @@ class VectorDriver:
             except Exception:
                 pass  # Index already exists
 
+    COHERE_BATCH_SIZE = 96   # Cohere embed API limit per request
+    EMBED_MAX_RETRIES = 3    # Retry on transient failures (rate limit, 5xx)
+    EMBED_BASE_DELAY = 2.0   # Exponential backoff base delay in seconds
+
     @traceable(name="Embed Texts (Cohere)", run_type="tool")
     async def _embed_texts(
         self, texts: List[str], input_type: str = "search_document"
     ) -> List[List[float]]:
         """
         Batch embed via Cohere embed-v4.
+        Auto-batches into chunks of 96 (Cohere API limit).
+        Retries each batch up to 3 times with exponential backoff.
 
         input_type: "search_document" for indexing, "search_query" for queries.
         """
-        response = await self.cohere_client.embed(
-            texts=texts,
-            model=SystemConfig.EMBEDDING_MODEL,
-            input_type=input_type,
-            embedding_types=["float"],
-        )
-        return response.embeddings.float_
+        all_embeddings: List[List[float]] = []
+        for i in range(0, len(texts), self.COHERE_BATCH_SIZE):
+            batch = texts[i : i + self.COHERE_BATCH_SIZE]
+            batch_num = i // self.COHERE_BATCH_SIZE + 1
+
+            for attempt in range(1, self.EMBED_MAX_RETRIES + 1):
+                try:
+                    response = await self.cohere_client.embed(
+                        texts=batch,
+                        model=SystemConfig.EMBEDDING_MODEL,
+                        input_type=input_type,
+                        embedding_types=["float"],
+                    )
+                    all_embeddings.extend(response.embeddings.float_)
+                    break
+                except Exception as e:
+                    if attempt == self.EMBED_MAX_RETRIES:
+                        logger.error(
+                            f"Embed batch {batch_num} failed after {self.EMBED_MAX_RETRIES} "
+                            f"attempts: {e}"
+                        )
+                        raise
+                    delay = self.EMBED_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Embed batch {batch_num} attempt {attempt} failed: {e}. "
+                        f"Retrying in {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+
+        return all_embeddings
 
     @traceable(name="Index Chunks (Hybrid)", run_type="tool")
     async def index(self, chunks: List[IndexableChunk]) -> bool:
@@ -318,6 +348,58 @@ class VectorDriver:
             points, next_offset = self.client.scroll(
                 collection_name=self.COLLECTION_NAME,
                 scroll_filter=page_filter,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            all_points.extend(points)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return all_points
+
+    def scroll_by_doc(
+        self,
+        doc_hash: str,
+        item_type: Optional[str] = None,
+        chunk_role: Optional[str] = None,
+    ) -> list:
+        """
+        Returns all Qdrant points for a document, optionally filtered.
+        Used by: Metric Explorer (item_type=visual, chunk_role=series), TSV export (no filter).
+        """
+        all_points = []
+        offset = None
+
+        conditions = [
+            models.FieldCondition(
+                key="doc_hash",
+                match=models.MatchValue(value=doc_hash),
+            ),
+        ]
+        if item_type:
+            conditions.append(
+                models.FieldCondition(
+                    key="item_type",
+                    match=models.MatchValue(value=item_type),
+                )
+            )
+        if chunk_role:
+            conditions.append(
+                models.FieldCondition(
+                    key="chunk_role",
+                    match=models.MatchValue(value=chunk_role),
+                )
+            )
+
+        doc_filter = models.Filter(must=conditions)
+
+        while True:
+            points, next_offset = self.client.scroll(
+                collection_name=self.COLLECTION_NAME,
+                scroll_filter=doc_filter,
                 limit=100,
                 offset=offset,
                 with_payload=True,

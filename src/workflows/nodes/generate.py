@@ -24,8 +24,14 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 
 class CitedSegment(BaseModel):
-    """A sentence or short passage with its supporting source IDs."""
-    text: str = Field(description="A sentence or short passage of the answer.")
+    """A single factual claim or clause with its supporting source IDs."""
+    text: str = Field(
+        description=(
+            "A single factual claim, clause, or short phrase. "
+            "When a sentence lists multiple data points (e.g. quarterly figures), "
+            "split into one segment per data point."
+        )
+    )
     source_ids: List[int] = Field(
         default_factory=list,
         description=(
@@ -36,11 +42,11 @@ class CitedSegment(BaseModel):
 
 
 class StructuredAnswer(BaseModel):
-    """Answer broken into citable segments."""
+    """Answer broken into fine-grained citable segments."""
     segments: List[CitedSegment] = Field(
         description=(
-            "The answer broken into segments. Each segment is a sentence or "
-            "short passage with optional source citations."
+            "The answer broken into segments at the factual-claim level. "
+            "Each distinct number, metric, or factual assertion is its own segment."
         )
     )
 
@@ -52,8 +58,11 @@ class StructuredAnswer(BaseModel):
 _GENERATION_PROMPT = """You are a senior financial analyst assistant. Answer the user's question using ONLY the provided sources.
 
 RULES:
-1. Break your answer into segments (sentences or short passages).
-2. For each segment, provide the source IDs (the integer from the source id= attribute) that support that claim.
+1. Break your answer into fine-grained segments — one per distinct factual claim.
+   - Each data point (dollar amount, percentage, metric value) MUST be its own segment.
+   - Example: "Q1 was $16,836 million," is one segment; "Q2 was $13,454 million," is the next.
+   - Introductory or transitional phrases with no data are their own segment (empty source_ids).
+2. For each segment, provide the source IDs (the integer from the source id= attribute) that support that specific claim.
 3. Only cite sources that directly support the specific claim. Leave source_ids empty for transitional text.
 4. If the sources don't contain enough information, say so explicitly.
 5. When SQL results are provided, incorporate the specific numbers into your answer.

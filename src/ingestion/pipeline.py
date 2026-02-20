@@ -21,8 +21,11 @@ import logging
 import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Union
+from typing import Callable, Optional, Union
 from langsmith import traceable
+
+# Progress callback signature: (phase: str, detail: str) -> None
+ProgressCallback = Callable[[str, str], None]
 
 # Internal Components
 from src.ingestion.router import SmartRouter, ProcessingRoute
@@ -51,13 +54,20 @@ class IngestionPipeline:
         self.analytics = AnalyticsDriver()
         
     @traceable(name="Run Ingestion Pipeline", run_type="chain")
-    async def run(self, file_path: Path) -> Union[UnifiedDocument, IngestionResult]:
+    async def run(
+        self,
+        file_path: Path,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> Union[UnifiedDocument, IngestionResult]:
         """
         Main entry point for processing a single file.
         Returns UnifiedDocument on success to satisfy run_ingestion.py.
+
+        on_progress: Optional callback (phase, detail) for SSE progress reporting.
         """
         start_time = datetime.now()
         logger.info(f"🚀 Pipeline triggered for: {file_path.name}")
+        _emit = on_progress or (lambda phase, detail: None)
         
         # 1. Routing (The Decision Layer)
         # ------------------------------------------------------------------
@@ -96,34 +106,34 @@ class IngestionPipeline:
         # 2. Execution (The Dual Helix)
         # ------------------------------------------------------------------
         try:
+            _emit("parsing", f"Parsing {file_path.name}...")
             if route == ProcessingRoute.HELIX_A_VISUAL:
-                # [CONTRACT ENFORCEMENT] Must return UnifiedDocument Object
                 doc = await self.pdf_parser.parse(file_path)
             elif route == ProcessingRoute.HELIX_B_NATIVE:
-                # TODO: Update native parser to return UnifiedDocument
                 doc = await self.native_parser.parse(file_path)
             else:
                 raise ValueError(f"Route {route} not implemented")
-            
-            # [VALIDATION] Ensure the Parser honored the contract
+
             if not isinstance(doc, UnifiedDocument) or not doc.items:
                 raise ValueError("Parser returned empty or invalid document")
-                
-            # Extract Hash safely from the stream (using first item's source)
+
+            n_items = len(doc.items)
+            n_quarantined = len(doc.quarantined_items) if doc.quarantined_items else 0
+            _emit("parsed", f"{n_items} items extracted, {n_quarantined} quarantined")
+
             doc_hash = doc.items[0].source.file_hash if doc.items else "unknown_hash"
-            
-            # 3. Indexing (The Search Truth)
-            # ------------------------------------------------------------------
-            # 3a. Vector index: flatten items → chunks → Qdrant (dense + sparse)
-            # Clean up any existing chunks first (prevents duplicates on re-ingestion)
+
+            # 3. Indexing
+            _emit("indexing", "Chunking and embedding...")
             logger.info("Cleaning old vectors & indexing to Qdrant...")
             await self.indexer.delete_by_doc_hash(doc_hash)
 
             chunks = flatten_document(doc)
             if chunks:
+                _emit("indexing", f"Embedding {len(chunks)} chunks...")
                 await self.indexer.index(chunks)
 
-            # 3b. Analytics index: flatten MetricSeries → Postgres metric_facts
+            _emit("indexing", "Writing metric facts to Postgres...")
             logger.info("Indexing metric facts to Postgres...")
             self.analytics.index_metrics(doc)
             

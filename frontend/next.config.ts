@@ -6,6 +6,12 @@ const nextConfig: NextConfig = {
     config.resolve.alias.canvas = false;
     return config;
   },
+  // Turbopack equivalent (Next.js 16 default bundler)
+  turbopack: {
+    resolveAlias: {
+      canvas: { browser: "" },
+    },
+  },
 };
 
 export default nextConfig;

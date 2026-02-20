@@ -90,7 +90,6 @@ export default function ChatPanel() {
       query,
       { doc_filter: docFilter, messages: history },
       (event) => {
-        console.log("[SSE]", event.type, event.content);
         const chatStore = useChatStore.getState();
 
         if (event.type === "route") {
@@ -173,7 +172,7 @@ export default function ChatPanel() {
         {messages.map((msg, i) => (
           <div
             key={i}
-            className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+            className={`flex animate-message-arrive ${msg.role === "user" ? "justify-end" : "justify-start"}`}
           >
             <div
               className={`max-w-[85%] px-3 py-2 rounded-lg text-sm ${
@@ -270,7 +269,7 @@ export default function ChatPanel() {
           <button
             type="submit"
             disabled={isThinking}
-            className="p-2 bg-[var(--accent)] rounded-lg hover:bg-[var(--accent-hover)] disabled:opacity-40 transition-colors"
+            className="btn-primary p-2"
           >
             <Send size={16} />
           </button>

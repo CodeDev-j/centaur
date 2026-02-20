@@ -9,17 +9,18 @@ import { Citation, getPdfUrl } from "@/lib/api";
 import { useDocStore } from "@/stores/useDocStore";
 import { useViewerStore } from "@/stores/useViewerStore";
 import BboxOverlay from "./BboxOverlay";
+import WelcomeDropzone from "./WelcomeDropzone";
 
 // Configure PDF.js worker
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
 interface DocumentViewerProps {
-  highlightBbox?: { x: number; y: number; width: number; height: number } | null;
+  highlightBboxes?: { x: number; y: number; width: number; height: number }[] | null;
   activeCitation?: Citation | null;
 }
 
 export default function DocumentViewer({
-  highlightBbox,
+  highlightBboxes,
   activeCitation,
 }: DocumentViewerProps) {
   const docHash = useDocStore((s) => s.selectedDocHash);
@@ -109,24 +110,19 @@ export default function DocumentViewer({
     return () => container.removeEventListener("wheel", handleWheel);
   }, []);
 
-  // Build overlay
-  const inspectOverlay = highlightBbox
-    ? {
-        source_file: "",
-        page_number: currentPage,
-        blurb: "Inspected chunk",
-        bbox: { page_number: currentPage, ...highlightBbox },
-      }
-    : null;
-
-  const overlaySource = inspectOverlay || activeCitation || null;
+  // Build overlays — multiple fine-grained bboxes for inspect, single for citation
+  const inspectOverlays: Citation[] | null =
+    highlightBboxes && highlightBboxes.length > 0
+      ? highlightBboxes.map((box, i) => ({
+          source_file: "",
+          page_number: currentPage,
+          blurb: `Value ${i + 1}`,
+          bbox: { page_number: currentPage, ...box },
+        }))
+      : null;
 
   if (!docHash) {
-    return (
-      <div className="flex items-center justify-center h-full text-[var(--text-secondary)]">
-        <p>Select a document to view</p>
-      </div>
-    );
+    return <WelcomeDropzone />;
   }
 
   const pdfUrl = getPdfUrl(docHash);
@@ -135,7 +131,7 @@ export default function DocumentViewer({
   return (
     <div className="flex flex-col h-full relative">
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)]">
+      <div className="flex items-center justify-between px-4 h-12 border-b border-[var(--border)] shrink-0">
         <div className="flex items-center gap-2">
           <button
             onClick={toggleSidebar}
@@ -193,9 +189,21 @@ export default function DocumentViewer({
             />
           </Document>
 
-          {overlaySource && (
+          {/* Inspect overlays: multiple fine-grained value bboxes */}
+          {inspectOverlays?.map((overlay, i) => (
             <BboxOverlay
-              citation={overlaySource}
+              key={`inspect-${i}`}
+              citation={overlay}
+              containerWidth={renderedSize.width}
+              containerHeight={renderedSize.height}
+              isActive
+            />
+          ))}
+
+          {/* Citation overlay: single bbox from chat */}
+          {!inspectOverlays && activeCitation && (
+            <BboxOverlay
+              citation={activeCitation}
               containerWidth={renderedSize.width}
               containerHeight={renderedSize.height}
               isActive
