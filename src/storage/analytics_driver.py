@@ -279,12 +279,34 @@ class AnalyticsDriver:
         """
         Executes a read-only SQL query against metric_facts.
         Used by the Text-to-SQL pipeline.
+
+        Safety layers:
+        1. Multi-statement guard — rejects queries containing semicolons
+        2. SELECT-only guard — rejects non-SELECT queries
+        3. READ ONLY transaction — Postgres-enforced DML prevention
         """
+        stripped = sql.strip().rstrip(";")
+
+        # Guard 1: Block multi-statement injection (e.g. "SELECT 1; DROP TABLE")
+        if ";" in stripped:
+            raise ValueError("Multi-statement SQL queries are not allowed")
+
+        # Guard 2: Only allow SELECT
+        if not stripped.upper().lstrip().startswith("SELECT"):
+            raise ValueError("Only SELECT queries are allowed")
+
         session = self.SessionLocal()
         try:
-            result = session.execute(sql_text(sql))
+            # Guard 3: Postgres-enforced read-only transaction
+            session.execute(sql_text("SET TRANSACTION READ ONLY"))
+            result = session.execute(sql_text(stripped))
             columns = result.keys()
-            return [dict(zip(columns, row)) for row in result.fetchall()]
+            rows = [dict(zip(columns, row)) for row in result.fetchall()]
+            session.rollback()  # Read-only — nothing to commit
+            return rows
+        except Exception:
+            session.rollback()
+            raise
         finally:
             session.close()
 

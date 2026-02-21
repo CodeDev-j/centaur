@@ -1,14 +1,16 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState, useMemo } from "react";
+import { PanelLeftOpen } from "lucide-react";
 import DocumentList from "@/components/DocumentList";
 import DocumentViewer from "@/components/DocumentViewer";
+import ErrorBoundary from "@/components/ErrorBoundary";
 import RightPanel from "@/components/RightPanel";
 import { useDocStore } from "@/stores/useDocStore";
 import { useViewerStore } from "@/stores/useViewerStore";
 import { useChatStore } from "@/stores/useChatStore";
 import { useInspectStore } from "@/stores/useInspectStore";
-import { fetchPageChunks, fetchDocChunks, fetchDocStats } from "@/lib/api";
+import { fetchDocChunks, fetchDocStats } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 
 export default function Home() {
@@ -16,8 +18,17 @@ export default function Home() {
   const selectedDocHash = useDocStore((s) => s.selectedDocHash);
   const currentPage = useViewerStore((s) => s.currentPage);
   const sidebarCollapsed = useViewerStore((s) => s.sidebarCollapsed);
-  const rightPanelTab = useInspectStore((s) => s.rightPanelTab);
-  const inspectMode = rightPanelTab === "inspect";
+  const openPanels = useInspectStore((s) => s.openPanels);
+
+  // H3 fix: Zustand persist rehydrates sidebarCollapsed from localStorage on client
+  // only. Render server-default (false) until mounted to avoid hydration mismatch.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const effectiveSidebarCollapsed = mounted ? sidebarCollapsed : false;
+
+  const inspectOpen = openPanels.includes("inspect");
+  const exploreOpen = openPanels.includes("explore");
+  const chatOpen = openPanels.includes("chat");
 
   // ---------------------------------------------------------------------------
   // Auto-collapse sidebar on narrow viewports (< 1280px)
@@ -38,23 +49,32 @@ export default function Home() {
   }, []);
 
   // ---------------------------------------------------------------------------
-  // Fetch chunks when inspect tab is active and page/document changes
+  // Smart default: selecting a document opens Explorer alongside Chat
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!inspectMode || !selectedDocHash) return;
+    if (selectedDocHash) {
+      useInspectStore.getState().ensurePanelOpen("explore");
+    }
+  }, [selectedDocHash]);
+
+  // ---------------------------------------------------------------------------
+  // Fetch all document chunks when inspect panel is open and document changes
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!inspectOpen || !selectedDocHash) return;
 
     let cancelled = false;
     useInspectStore.getState().setInspectLoading(true);
     useInspectStore.getState().setActiveChunkId(null);
 
-    fetchPageChunks(selectedDocHash, currentPage)
+    fetchDocChunks(selectedDocHash)
       .then((data) => {
-        if (!cancelled) useInspectStore.getState().setInspectChunks(data.chunks);
+        if (!cancelled) useInspectStore.getState().setInspectAllChunks(data.chunks);
       })
       .catch((err) => {
         if (!cancelled) {
           console.error("Failed to fetch chunks:", err);
-          useInspectStore.getState().setInspectChunks(null);
+          useInspectStore.getState().setInspectAllChunks(null);
         }
       })
       .finally(() => {
@@ -62,13 +82,13 @@ export default function Home() {
       });
 
     return () => { cancelled = true; };
-  }, [inspectMode, selectedDocHash, currentPage]);
+  }, [inspectOpen, selectedDocHash]);
 
   // ---------------------------------------------------------------------------
-  // Fetch explorer data when explore tab is active and document changes
+  // Fetch explorer data when explore panel is open and document changes
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (rightPanelTab !== "explore" || !selectedDocHash) return;
+    if (!exploreOpen || !selectedDocHash) return;
 
     let cancelled = false;
     useInspectStore.getState().setExplorerLoading(true);
@@ -94,7 +114,7 @@ export default function Home() {
       });
 
     return () => { cancelled = true; };
-  }, [rightPanelTab, selectedDocHash]);
+  }, [exploreOpen, selectedDocHash]);
 
   // ---------------------------------------------------------------------------
   // Fetch document stats when document changes
@@ -106,64 +126,119 @@ export default function Home() {
     }
     fetchDocStats(selectedDocHash)
       .then((stats) => useInspectStore.getState().setDocStats(stats))
-      .catch(() => useInspectStore.getState().setDocStats(null));
+      .catch((err) => {
+        console.error("fetchDocStats failed:", err);
+        useInspectStore.getState().setDocStats(null);
+      });
   }, [selectedDocHash]);
 
   // ---------------------------------------------------------------------------
-  // Compute chunk highlight bboxes for DocumentViewer
-  // Fine-grained value_bboxes when available, coarse bbox as fallback
+  // Compute chunk highlight bboxes for DocumentViewer (P2: memoized)
   // ---------------------------------------------------------------------------
   const activeChunkId = useInspectStore((s) => s.activeChunkId);
-  const inspectChunks = useInspectStore((s) => s.inspectChunks);
+  const inspectAllChunks = useInspectStore((s) => s.inspectAllChunks);
   const activeChunk =
-    inspectMode && activeChunkId
-      ? inspectChunks?.find((c) => c.chunk_id === activeChunkId) ?? null
+    inspectOpen && activeChunkId
+      ? inspectAllChunks?.find((c) => c.chunk_id === activeChunkId) ?? null
       : null;
 
-  let highlightBboxes: { x: number; y: number; width: number; height: number }[] | null = null;
-  if (inspectMode && activeChunk) {
+  const highlightBboxes = useMemo(() => {
+    if (!inspectOpen || !activeChunk) return null;
     const vb = activeChunk.value_bboxes;
     if (vb && Object.keys(vb).length > 0) {
-      highlightBboxes = Object.values(vb).flatMap((rects) =>
+      // For series chunks, filter to only this series' values + label
+      if (activeChunk.chunk_role === "series") {
+        const seriesLabel = activeChunk.metadata?.series_label
+          ? String(activeChunk.metadata.series_label)
+          : null;
+        // Extract numeric values from chunk text: "Data: 2018=USD 0.8B, ..."
+        const seriesNums: number[] = [];
+        const dataMatch = activeChunk.chunk_text?.match(/Data:\s*(.+)/);
+        if (dataMatch) {
+          const re = /=(?:[A-Z]{3}\s)?(-?[\d.]+)/g;
+          let m;
+          while ((m = re.exec(dataMatch[1])) !== null) {
+            seriesNums.push(parseFloat(m[1]));
+          }
+        }
+        if (seriesLabel || seriesNums.length > 0) {
+          // Compare numerically (avoids "17.0" vs "17" mismatch)
+          const filtered = Object.entries(vb).filter(([key]) => {
+            if (seriesLabel && key === seriesLabel) return true;
+            const keyNum = parseFloat(key);
+            if (isNaN(keyNum)) return false;
+            return seriesNums.some((v) => Math.abs(v - keyNum) < 0.01);
+          });
+          if (filtered.length > 0) {
+            // If chunk has a coarse bbox (chart region), exclude bboxes outside it
+            const region = activeChunk.bbox;
+            return filtered.flatMap(([, rects]) =>
+              rects
+                .filter(([bx, by]) =>
+                  !region ||
+                  (bx >= region.x - 0.02 &&
+                    by >= region.y - 0.02 &&
+                    bx <= region.x + region.width + 0.02 &&
+                    by <= region.y + region.height + 0.02)
+                )
+                .map(([x, y, width, height]) => ({ x, y, width, height }))
+            );
+          }
+        }
+      }
+      // Summary/narrative/table chunks: show all bboxes
+      return Object.values(vb).flatMap((rects) =>
         rects.map(([x, y, width, height]) => ({ x, y, width, height }))
       );
-    } else if (activeChunk.bbox) {
-      highlightBboxes = [activeChunk.bbox];
     }
-  }
+    if (activeChunk.bbox) return [activeChunk.bbox];
+    return null;
+  }, [inspectOpen, activeChunk]);
 
-  // Citation overlay (only when on chat tab)
+  // Citation overlay (when chat panel is open)
   const activeCitationIndex = useChatStore((s) => s.activeCitationIndex);
   const citations = useChatStore((s) => s.citations);
 
   return (
     <div className="app-shell h-screen flex">
       {/* Left sidebar: Document list */}
-      <div
-        className={`panel-left border-r border-[var(--border)] bg-[var(--bg-secondary)] shrink-0 transition-all duration-200 ${
-          sidebarCollapsed ? "w-0 overflow-hidden" : "w-64"
-        }`}
-      >
-        <DocumentList />
-      </div>
+      {effectiveSidebarCollapsed ? (
+        <button
+          onClick={() => useViewerStore.getState().toggleSidebar()}
+          className="sidebar-rail shrink-0"
+          title="Show sidebar (Ctrl+B)"
+        >
+          <span
+            className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]"
+            style={{ boxShadow: "0 0 6px var(--accent)" }}
+          />
+          <PanelLeftOpen size={14} className="text-[var(--text-secondary)]" />
+        </button>
+      ) : (
+        <div className="panel-left border-r border-[var(--border)] bg-[var(--bg-secondary)] shrink-0 w-64">
+          <DocumentList />
+        </div>
+      )}
 
       {/* Center: Document viewer (desk — deepest Z-layer) */}
       <div className="panel-center flex-1 min-w-0 bg-[var(--bg-desk)]">
-        <DocumentViewer
-          highlightBboxes={highlightBboxes}
-          activeCitation={
-            rightPanelTab === "chat" &&
-            activeCitationIndex !== null &&
-            activeCitationIndex < citations.length &&
-            citations[activeCitationIndex]?.bbox?.page_number === currentPage
-              ? citations[activeCitationIndex]
-              : null
-          }
-        />
+        <ErrorBoundary>
+          <DocumentViewer
+            highlightBboxes={highlightBboxes}
+            activeCitation={
+              chatOpen &&
+              activeCitationIndex !== null &&
+              activeCitationIndex < citations.length &&
+              citations[activeCitationIndex]?.bbox?.page_number === currentPage
+                ? citations[activeCitationIndex]
+                : null
+            }
+          />
+        </ErrorBoundary>
       </div>
 
-      {/* Right panel: Chat + Inspect + Explorer tabs */}
-      <div className="panel-right w-96 border-l border-[var(--border)] bg-[var(--bg-secondary)] shrink-0">
+      {/* Right: Panel bay (toggle pills + multi-column panels) */}
+      <div className="panel-right border-l border-[var(--border)] shrink-0">
         <RightPanel />
       </div>
     </div>

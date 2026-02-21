@@ -12,7 +12,7 @@ import { useChatStore } from "@/stores/useChatStore";
  * Escape           — deselect citation/chunk, blur input
  * / or Ctrl+K      — focus chat input
  * Ctrl+B / Cmd+B   — toggle sidebar
- * 1 / 2 / 3        — switch right panel tab
+ * 1 / 2 / 3 / 4    — toggle panel (chat, inspect, explore, studio)
  * Ctrl+Shift+C     — copy current page chunks as TSV
  * j / k             — move up/down in Explorer rows
  * Enter             — navigate PDF to active Explorer row's page
@@ -68,24 +68,28 @@ export function useKeyboardShortcuts() {
           break;
         }
 
-        // Right panel tabs
+        // Toggle panels (1 = chat, 2 = inspect, 3 = explore)
         case e.key === "1" && !ctrl: {
-          useInspectStore.getState().setRightPanelTab("chat");
+          useInspectStore.getState().togglePanel("chat");
           break;
         }
         case e.key === "2" && !ctrl: {
-          useInspectStore.getState().setRightPanelTab("inspect");
+          useInspectStore.getState().togglePanel("inspect");
           break;
         }
         case e.key === "3" && !ctrl: {
-          useInspectStore.getState().setRightPanelTab("explore");
+          useInspectStore.getState().togglePanel("explore");
+          break;
+        }
+        case e.key === "4" && !ctrl: {
+          useInspectStore.getState().togglePanel("studio");
           break;
         }
 
         // Explorer: move down
         case e.key === "j" && !ctrl: {
-          const tab = useInspectStore.getState().rightPanelTab;
-          if (tab !== "explore") break;
+          const { openPanels } = useInspectStore.getState();
+          if (!openPanels.includes("explore")) break;
           e.preventDefault();
           const { explorerActiveRowIdx, explorerFlatRowCount } = useInspectStore.getState();
           const maxIdx = explorerFlatRowCount - 1;
@@ -97,8 +101,8 @@ export function useKeyboardShortcuts() {
 
         // Explorer: move up
         case e.key === "k" && !ctrl: {
-          const tab = useInspectStore.getState().rightPanelTab;
-          if (tab !== "explore") break;
+          const { openPanels } = useInspectStore.getState();
+          if (!openPanels.includes("explore")) break;
           e.preventDefault();
           const { explorerActiveRowIdx: idx } = useInspectStore.getState();
           const prev = idx === null ? 0 : Math.max(idx - 1, 0);
@@ -108,10 +112,8 @@ export function useKeyboardShortcuts() {
 
         // Explorer: navigate to active row's page
         case e.key === "Enter" && !ctrl: {
-          const tab = useInspectStore.getState().rightPanelTab;
-          if (tab !== "explore") break;
-          // Enter is handled by MetricExplorerPanel's active row logic
-          // (the row component auto-navigates on selection via the store)
+          const { openPanels } = useInspectStore.getState();
+          if (!openPanels.includes("explore")) break;
           break;
         }
 

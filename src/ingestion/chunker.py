@@ -240,7 +240,17 @@ def _chunk_visual(doc: UnifiedDocument, item: VisualItem) -> List[IndexableChunk
         if series.source_region_id is not None:
             meta["source_region_id"] = series.source_region_id
         _inject_bbox(meta, item.source)
-        _inject_value_bboxes(meta, item)
+        # Per-series: filter value_bboxes to only this series' label + numeric values
+        if hasattr(item, 'value_bboxes') and item.value_bboxes:
+            series_keys = {series.series_label}
+            for dp in series.data_points:
+                if dp.numeric_value is not None:
+                    series_keys.add(str(float(dp.numeric_value)))
+            filtered_vb = {k: v for k, v in item.value_bboxes.items() if k in series_keys}
+            if filtered_vb:
+                meta["value_bboxes"] = filtered_vb
+        else:
+            _inject_value_bboxes(meta, item)
 
         chunks.append(_make_chunk(
             doc=doc,

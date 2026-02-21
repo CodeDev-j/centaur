@@ -177,8 +177,8 @@ async def get_page_image(doc_hash: str, page_number: int):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to render page: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to render page: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to render page")
 
 
 @router.get("/{doc_hash}/page/{page_number}/regions", response_model=List[RegionOverlay])

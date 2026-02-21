@@ -39,6 +39,10 @@ async def startup():
     from src.api.routes.chat import set_graph
     from src.api.routes.ingestion import set_pipeline
     from src.api.routes.documents import set_vector_driver
+    from src.workflows.prompt_executor import (
+        set_retrieval_pipeline as set_executor_pipeline,
+        set_analytics_driver as set_executor_analytics,
+    )
 
     logger.info("Initializing Centaur API...")
 
@@ -54,15 +58,25 @@ async def startup():
     vector_driver = VectorDriver()
     set_vector_driver(vector_driver)
 
+    # Wire prompt executor with retrieval pipeline + analytics driver
+    # (reuses the same instances created by build_graph)
+    from src.workflows.nodes.retrieve import _retrieval_pipeline, _analytics_driver
+    if _retrieval_pipeline:
+        set_executor_pipeline(_retrieval_pipeline)
+    if _analytics_driver:
+        set_executor_analytics(_analytics_driver)
+
     logger.info("Centaur API ready.")
 
 
 # Register routes
-from src.api.routes import chat, ingestion, documents  # noqa: E402
+from src.api.routes import chat, ingestion, documents, prompts, workflows  # noqa: E402
 
 app.include_router(chat.router)
 app.include_router(ingestion.router)
 app.include_router(documents.router)
+app.include_router(prompts.router)
+app.include_router(workflows.router)
 
 
 @app.get("/health")
@@ -71,10 +85,12 @@ async def health():
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
+    SystemConfig._check_defaults()
     uvicorn.run(
         "src.api.main:app",
         host=SystemConfig.API_HOST,
         port=SystemConfig.API_PORT,
-        reload=True,
+        reload=os.getenv("CENTAUR_DEV", "").lower() in ("1", "true"),
     )

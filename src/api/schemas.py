@@ -10,16 +10,16 @@ from src.schemas.citation import Citation
 
 class ChatMessage(BaseModel):
     """A single message in conversation history."""
-    role: str = Field(..., description="'user' or 'assistant'")
-    content: str = Field(..., description="Message text")
+    role: str = Field(..., pattern=r"^(user|assistant)$", description="'user' or 'assistant'")
+    content: str = Field(..., min_length=1, max_length=50_000, description="Message text")
 
 
 class ChatRequest(BaseModel):
     """Incoming chat query."""
-    query: str = Field(..., min_length=1, description="The user's question")
-    locale: Optional[str] = Field("en", description="User locale: en, de, fr")
-    doc_filter: Optional[str] = Field(None, description="Filter by doc_hash")
-    messages: Optional[List[ChatMessage]] = Field(None, description="Conversation history for multi-turn")
+    query: str = Field(..., min_length=1, max_length=10_000, description="The user's question")
+    locale: Optional[str] = Field("en", pattern=r"^[a-z]{2}$", description="User locale: en, de, fr")
+    doc_filter: Optional[str] = Field(None, pattern=r"^[a-fA-F0-9]{64}$", description="SHA-256 doc_hash")
+    messages: Optional[List[ChatMessage]] = Field(None, max_length=50, description="Conversation history for multi-turn")
 
 
 class ChatResponse(BaseModel):

@@ -78,8 +78,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
     try:
         result = await _graph.ainvoke(initial_state)
     except Exception as e:
-        logger.error(f"Graph execution failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Graph execution failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
     return ChatResponse(
         answer=result.get("final_answer", ""),
@@ -128,7 +128,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
 
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'content': 'An internal error occurred'})}\n\n"
 
     return StreamingResponse(
         event_generator(),

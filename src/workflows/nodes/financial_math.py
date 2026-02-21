@@ -83,6 +83,11 @@ async def generate_and_execute_sql(
             logger.warning(f"Non-SELECT SQL generated, refusing: {sql[:100]}")
             return []
 
+        # Safety: block multi-statement injection (redundant with driver guard)
+        if ";" in sql.strip().rstrip(";"):
+            logger.warning(f"Multi-statement SQL generated, refusing: {sql[:100]}")
+            return []
+
         logger.info(f"Generated SQL: {sql[:200]}")
         result = analytics_driver.execute_sql(sql)
         logger.info(f"SQL returned {len(result)} rows")

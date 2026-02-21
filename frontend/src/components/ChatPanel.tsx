@@ -6,6 +6,7 @@ import { streamChat, ChatMessagePayload } from "@/lib/api";
 import { useChatStore, ChatMessage, StreamStep } from "@/stores/useChatStore";
 import { useDocStore } from "@/stores/useDocStore";
 import { useViewerStore } from "@/stores/useViewerStore";
+import { useInspectStore } from "@/stores/useInspectStore";
 
 /** Maximum number of prior messages to send for multi-turn context */
 const MAX_HISTORY = 6;
@@ -21,6 +22,10 @@ export default function ChatPanel() {
 
   const inputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const activeStreamRef = useRef<{ cancel: () => void } | null>(null);
+
+  // R2 fix: cancel in-flight stream on unmount
+  useEffect(() => () => { activeStreamRef.current?.cancel(); }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -41,6 +46,9 @@ export default function ChatPanel() {
     }
 
     useChatStore.getState().setActiveCitationIndex(index);
+
+    // Smart default: auto-open Inspect panel when clicking a citation
+    useInspectStore.getState().ensurePanelOpen("inspect");
   }, []);
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
@@ -86,7 +94,10 @@ export default function ChatPanel() {
     let finalCitations: typeof citations = [];
     let routeValue = "";
 
-    const { done } = streamChat(
+    // R2 fix: cancel any in-flight stream before starting new one
+    activeStreamRef.current?.cancel();
+
+    const stream = streamChat(
       query,
       { doc_filter: docFilter, messages: history },
       (event) => {
@@ -123,8 +134,15 @@ export default function ChatPanel() {
         }
       }
     );
+    activeStreamRef.current = stream;
 
-    await done;
+    try {
+      await stream.done;
+    } catch {
+      // AbortError from cancellation — handled by onEvent
+    } finally {
+      activeStreamRef.current = null;
+    }
 
     // Replace ghost bubble with final answer
     const chatStore = useChatStore.getState();
@@ -148,7 +166,7 @@ export default function ChatPanel() {
       });
     }
     chatStore.setIsThinking(false);
-  }, [citations]);
+  }, []); // P4 fix: no deps needed — reads live from getState()
 
   const handleClear = useCallback(() => {
     useChatStore.getState().clearConversation();

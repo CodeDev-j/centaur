@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useCallback, useEffect, useRef, useState } from "react";
-import { Download, Search, ChevronDown, ChevronRight } from "lucide-react";
+import { Download, Search, ChevronDown, ChevronRight, List, Grid3x3, Copy, ArrowDownNarrowWide, FileText } from "lucide-react";
 import { useInspectStore } from "@/stores/useInspectStore";
 import { useViewerStore } from "@/stores/useViewerStore";
 import { useDocStore } from "@/stores/useDocStore";
@@ -11,10 +11,25 @@ import {
   groupByPage,
   formatValue,
   formatDelta,
+  collectPeriods,
+  rawNumericString,
+  rowToTsvLine,
   LedgerRow,
   LedgerPageGroup,
+  ParsedDataPoint,
 } from "@/lib/seriesParser";
 import MiniSparkline from "./MiniSparkline";
+
+// ─── Clipboard helper ───────────────────────────────────────────────
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ─── Filter Dropdown ─────────────────────────────────────────────────
 
@@ -29,7 +44,6 @@ function FilterPill({
   options: string[];
   onChange: (v: string | undefined) => void;
 }) {
-  // Auto-hide when 0 or 1 options (no filtering value)
   if (options.length <= 1) return null;
   return (
     <select
@@ -82,25 +96,40 @@ function PageGroupHeader({
   );
 }
 
-// ─── Ledger Row ──────────────────────────────────────────────────────
+// ─── Ledger Row (List View) ─────────────────────────────────────────
 
 function LedgerRowComponent({
   row,
   isActive,
   isExpanded,
   onSelect,
+  onCopyRow,
   rowRef,
 }: {
   row: LedgerRow;
   isActive: boolean;
   isExpanded: boolean;
   onSelect: () => void;
+  onCopyRow: () => void;
   rowRef: (el: HTMLDivElement | null) => void;
 }) {
   const sparkValues = row.dataPoints.map((dp) => dp.value);
+  const [flashValue, setFlashValue] = useState(false);
+
+  const handleCopyLatest = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      const last = row.dataPoints[row.dataPoints.length - 1];
+      if (!last) return;
+      copyText(rawNumericString(last.value));
+      setFlashValue(true);
+      setTimeout(() => setFlashValue(false), 150);
+    },
+    [row.dataPoints],
+  );
 
   return (
-    <div ref={rowRef}>
+    <div ref={rowRef} className="group">
       <button
         onClick={onSelect}
         className={`w-full flex items-center gap-1 px-3 py-1.5 text-left transition-colors border-l-2 ${
@@ -108,6 +137,7 @@ function LedgerRowComponent({
             ? "ledger-row-active border-[var(--accent)]"
             : "border-transparent hover:bg-[var(--bg-tertiary)]"
         }`}
+        style={{ minWidth: 340 }}
       >
         {/* Label */}
         <span className="text-[12px] text-[var(--text-primary)] truncate min-w-0 flex-1">
@@ -122,8 +152,14 @@ function LedgerRowComponent({
         {/* Sparkline */}
         <MiniSparkline values={sparkValues} width={48} height={18} />
 
-        {/* Latest value */}
-        <span className="text-[12px] font-mono tabular-nums text-[var(--text-primary)] w-[76px] text-right shrink-0">
+        {/* Latest value (clickable to copy) */}
+        <span
+          onClick={handleCopyLatest}
+          className={`text-[12px] font-mono tabular-nums text-[var(--text-primary)] w-[76px] text-right shrink-0 cursor-copy rounded px-0.5 ${
+            flashValue ? "copy-flash" : ""
+          }`}
+          title="Click to copy raw value"
+        >
           {row.formattedLatest}
         </span>
 
@@ -143,6 +179,18 @@ function LedgerRowComponent({
         ) : (
           <span className="w-[62px] shrink-0" />
         )}
+
+        {/* Per-row copy button (visible on hover) */}
+        <span
+          onClick={(e) => {
+            e.stopPropagation();
+            onCopyRow();
+          }}
+          className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] shrink-0"
+          title="Copy row as TSV"
+        >
+          <Copy size={11} />
+        </span>
       </button>
 
       {/* Expanded: Ticker Tape */}
@@ -185,6 +233,195 @@ function LedgerRowComponent({
   );
 }
 
+// ─── Table View ─────────────────────────────────────────────────────
+
+function TableView({
+  groups,
+  onNavigatePage,
+}: {
+  groups: LedgerPageGroup[];
+  onNavigatePage: (page: number) => void;
+}) {
+  const [flashCell, setFlashCell] = useState<string | null>(null);
+
+  const allRows = useMemo(() => groups.flatMap((g) => g.rows), [groups]);
+  const periods = useMemo(() => collectPeriods(allRows), [allRows]);
+
+  // Build lookup: chunkId → period → dataPoint
+  const matrix = useMemo(() => {
+    const m = new Map<string, Map<string, ParsedDataPoint>>();
+    for (const row of allRows) {
+      const rowMap = new Map<string, ParsedDataPoint>();
+      for (const dp of row.dataPoints) {
+        rowMap.set(dp.period, dp);
+      }
+      m.set(row.chunkId, rowMap);
+    }
+    return m;
+  }, [allRows]);
+
+  const handleCopyCell = useCallback((value: number, cellKey: string) => {
+    copyText(rawNumericString(value));
+    setFlashCell(cellKey);
+    setTimeout(() => setFlashCell(null), 150);
+  }, []);
+
+  const handleCopyTable = useCallback(() => {
+    const header = ["Metric", "Pg", ...periods, "Δ"].join("\t");
+    const rows = allRows.map((row) => {
+      const vals = periods.map((p) => {
+        const dp = matrix.get(row.chunkId)?.get(p);
+        return dp ? rawNumericString(dp.value) : "";
+      });
+      const delta = row.delta ? formatDelta(row.delta) : "";
+      return [row.label, row.pageNumber, ...vals, delta].join("\t");
+    });
+    copyText([header, ...rows].join("\n"));
+  }, [allRows, periods, matrix]);
+
+  // Track page group boundaries for visual separators
+  const rowPageMap = useMemo(() => {
+    const map = new Map<string, number>();
+    let groupIdx = 0;
+    for (const group of groups) {
+      for (const row of group.rows) {
+        map.set(row.chunkId, groupIdx);
+      }
+      groupIdx++;
+    }
+    return map;
+  }, [groups]);
+
+  return (
+    <div className="flex-1 overflow-auto explorer-scroll relative">
+      <table className="explorer-table">
+        <thead>
+          <tr>
+            <th className="col-metric text-left">Metric</th>
+            <th className="text-right" style={{ width: 28 }}>Pg</th>
+            {periods.map((p) => (
+              <th key={p} className="text-right">{p}</th>
+            ))}
+            <th className="text-center" style={{ width: 52 }}>Trend</th>
+            <th className="text-right" style={{ width: 64 }}>Δ</th>
+            <th style={{ width: 28 }}>
+              <button
+                onClick={handleCopyTable}
+                className="p-0.5 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)]"
+                title="Copy table to clipboard"
+              >
+                <Copy size={11} />
+              </button>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {allRows.map((row, ri) => {
+            const rowData = matrix.get(row.chunkId);
+            const prevGroupIdx = ri > 0 ? rowPageMap.get(allRows[ri - 1].chunkId) : undefined;
+            const curGroupIdx = rowPageMap.get(row.chunkId);
+            const isGroupBreak = ri > 0 && curGroupIdx !== prevGroupIdx;
+
+            return (
+              <tr
+                key={row.chunkId}
+                className={isGroupBreak ? "group-break" : ""}
+              >
+                <td
+                  className="col-metric cursor-pointer hover:text-[var(--accent)]"
+                  onClick={() => onNavigatePage(row.pageNumber)}
+                  title={`${row.label}${row.basis ? ` [${row.basis}]` : ""} — click to view page`}
+                >
+                  {row.label}
+                  {row.basis && (
+                    <span className="text-[10px] text-[var(--text-secondary)] ml-1">
+                      [{row.basis}]
+                    </span>
+                  )}
+                </td>
+                <td className="text-right text-[10px] text-[var(--text-secondary)]">
+                  {row.pageNumber}
+                </td>
+                {periods.map((p) => {
+                  const dp = rowData?.get(p);
+                  const cellKey = `${row.chunkId}:${p}`;
+                  return (
+                    <td
+                      key={p}
+                      className={`cell-value ${flashCell === cellKey ? "copy-flash" : ""}`}
+                      onClick={() => dp && handleCopyCell(dp.value, cellKey)}
+                    >
+                      {dp ? formatValue(dp.value, dp.magnitude, dp.currency) : ""}
+                    </td>
+                  );
+                })}
+                <td className="text-center">
+                  <MiniSparkline
+                    values={row.dataPoints.map((d) => d.value)}
+                    width={48}
+                    height={18}
+                  />
+                </td>
+                <td
+                  className={`text-right text-[11px] px-2 ${
+                    row.delta && row.delta.deltaPct > 0
+                      ? "delta-positive"
+                      : row.delta && row.delta.deltaPct < 0
+                        ? "delta-negative"
+                        : "text-[var(--text-secondary)]"
+                  }`}
+                >
+                  {row.delta ? formatDelta(row.delta) : ""}
+                </td>
+                <td />
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── Math Footer ────────────────────────────────────────────────────
+
+function MathFooter({ rows }: { rows: LedgerRow[] }) {
+  const stats = useMemo(() => {
+    const withDelta = rows.filter((r) => r.delta !== null);
+    const deltas = withDelta.map((r) => r.delta!.deltaPct);
+    const positive = deltas.filter((d) => d > 0).length;
+    const negative = deltas.filter((d) => d < 0).length;
+
+    // Median
+    const sorted = [...deltas].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const median =
+      sorted.length === 0
+        ? null
+        : sorted.length % 2 === 0
+          ? (sorted[mid - 1] + sorted[mid]) / 2
+          : sorted[mid];
+
+    return { total: rows.length, positive, negative, median };
+  }, [rows]);
+
+  if (stats.total === 0) return null;
+
+  return (
+    <div className="math-footer">
+      <span>Σ {stats.total}</span>
+      {stats.positive > 0 && <span className="text-[#10b981]">↑ {stats.positive}</span>}
+      {stats.negative > 0 && <span className="text-[#f43f5e]">↓ {stats.negative}</span>}
+      {stats.median !== null && (
+        <span>
+          Median Δ: {stats.median > 0 ? "+" : ""}
+          {stats.median.toFixed(1)}%
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Component ──────────────────────────────────────────────────
 
 export default function MetricExplorerPanel() {
@@ -196,6 +433,10 @@ export default function MetricExplorerPanel() {
   const searchQuery = useInspectStore((s) => s.explorerSearchQuery);
   const setSearchQuery = useInspectStore((s) => s.setExplorerSearchQuery);
   const activeRowIdx = useInspectStore((s) => s.explorerActiveRowIdx);
+  const viewMode = useInspectStore((s) => s.explorerViewMode);
+  const setViewMode = useInspectStore((s) => s.setExplorerViewMode);
+  const sortMode = useInspectStore((s) => s.explorerSortMode);
+  const setSortMode = useInspectStore((s) => s.setExplorerSortMode);
   const selectedDocHash = useDocStore((s) => s.selectedDocHash);
   const selectedFilename = useDocStore((s) => s.selectedFilename);
 
@@ -210,8 +451,8 @@ export default function MetricExplorerPanel() {
   }, [chunks]);
 
   const pageGroups = useMemo(() => {
-    return groupByPage(dedupedChunks, summaryChunks ?? []);
-  }, [dedupedChunks, summaryChunks]);
+    return groupByPage(dedupedChunks, summaryChunks ?? [], sortMode);
+  }, [dedupedChunks, summaryChunks, sortMode]);
 
   // Apply search + filters
   const filteredGroups = useMemo(() => {
@@ -230,23 +471,29 @@ export default function MetricExplorerPanel() {
       .filter((group) => group.rows.length > 0);
   }, [pageGroups, searchQuery, filters]);
 
-  // Flat row list for keyboard navigation
-  const flatRows = useMemo(() => {
+  // Flat row list for keyboard navigation + math footer
+  // P7 fix: precompute per-row flat indices here instead of mutable counter in render
+  const { flatRows, flatIndexMap } = useMemo(() => {
     const rows: LedgerRow[] = [];
+    const indexMap = new Map<string, number>();
+    let idx = 0;
     for (const group of filteredGroups) {
-      if (!collapsedPages.has(group.pageNumber)) {
-        rows.push(...group.rows);
+      if (viewMode === "table" || !collapsedPages.has(group.pageNumber)) {
+        for (const row of group.rows) {
+          indexMap.set(row.chunkId, idx++);
+          rows.push(row);
+        }
       }
     }
-    return rows;
-  }, [filteredGroups, collapsedPages]);
+    return { flatRows: rows, flatIndexMap: indexMap };
+  }, [filteredGroups, collapsedPages, viewMode]);
 
   // Total deduped count for header
   const totalDeduped = useMemo(() => {
     return pageGroups.reduce((sum, g) => sum + g.rows.length, 0);
   }, [pageGroups]);
 
-  // Filter options (extracted from all data, auto-hide when uniform)
+  // Filter options
   const filterOptions = useMemo(() => {
     const p = new Set<string>();
     const a = new Set<string>();
@@ -265,30 +512,35 @@ export default function MetricExplorerPanel() {
     };
   }, [pageGroups]);
 
-  // Sync flat row count to store for keyboard navigation bounds
+  // Sync flat row count to store
   useEffect(() => {
     useInspectStore.getState().setExplorerFlatRowCount(flatRows.length);
   }, [flatRows.length]);
 
-  // Scroll active row into view
+  // Scroll active row into view (list view only)
   useEffect(() => {
-    if (activeRowIdx === null) return;
+    if (activeRowIdx === null || viewMode !== "list") return;
     const el = rowRefs.current.get(activeRowIdx);
     el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  }, [activeRowIdx]);
+  }, [activeRowIdx, viewMode]);
 
   // ── Handlers ─────────────────────────────────────────────────────
   const handleRowSelect = useCallback(
     (row: LedgerRow, flatIdx: number) => {
-      // Navigate PDF to page
       useViewerStore.getState().setCurrentPage(row.pageNumber);
-      // Toggle expansion
       setExpandedChunkId((prev) => (prev === row.chunkId ? null : row.chunkId));
-      // Set active for keyboard
       useInspectStore.getState().setExplorerActiveRowIdx(flatIdx);
     },
     [],
   );
+
+  const handleCopyRow = useCallback((row: LedgerRow) => {
+    copyText(rowToTsvLine(row));
+  }, []);
+
+  const handleNavigatePage = useCallback((page: number) => {
+    useViewerStore.getState().setCurrentPage(page);
+  }, []);
 
   const handleDownload = useCallback(() => {
     if (!chunks || chunks.length === 0) return;
@@ -316,13 +568,10 @@ export default function MetricExplorerPanel() {
     );
   }
 
-  // Track flat index across groups for keyboard nav
-  let flatIdx = 0;
-
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-3 py-2 border-b border-[var(--border)] space-y-1.5">
+      <div className="px-3 py-2 border-b border-[var(--border)] space-y-1.5 shrink-0">
         <div className="flex items-center justify-between">
           <h3 className="text-[12px] font-semibold">
             Metric Explorer
@@ -332,14 +581,66 @@ export default function MetricExplorerPanel() {
               </span>
             )}
           </h3>
-          <button
-            onClick={handleDownload}
-            disabled={!chunks || chunks.length === 0}
-            className="p-1 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-30"
-            title="Download all metrics as TSV"
-          >
-            <Download size={13} />
-          </button>
+          <div className="flex items-center gap-1">
+            {/* Sort mode toggle */}
+            <div className="flex border border-[var(--border)] rounded overflow-hidden">
+              <button
+                onClick={() => setSortMode("document")}
+                className={`p-1 transition-colors ${
+                  sortMode === "document"
+                    ? "bg-[var(--bg-surface)] text-[var(--text-primary)]"
+                    : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                }`}
+                title="Document order (alphabetical within page groups)"
+              >
+                <FileText size={16} />
+              </button>
+              <button
+                onClick={() => setSortMode("statement")}
+                className={`p-1 transition-colors ${
+                  sortMode === "statement"
+                    ? "bg-[var(--bg-surface)] text-[var(--text-primary)]"
+                    : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                }`}
+                title="Statement order (income statement waterfall)"
+              >
+                <ArrowDownNarrowWide size={16} />
+              </button>
+            </div>
+            {/* View mode toggle */}
+            <div className="flex border border-[var(--border)] rounded overflow-hidden">
+              <button
+                onClick={() => setViewMode("list")}
+                className={`p-1 transition-colors ${
+                  viewMode === "list"
+                    ? "bg-[var(--bg-surface)] text-[var(--text-primary)]"
+                    : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                }`}
+                title="List view"
+              >
+                <List size={16} />
+              </button>
+              <button
+                onClick={() => setViewMode("table")}
+                className={`p-1 transition-colors ${
+                  viewMode === "table"
+                    ? "bg-[var(--bg-surface)] text-[var(--text-primary)]"
+                    : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                }`}
+                title="Table view"
+              >
+                <Grid3x3 size={16} />
+              </button>
+            </div>
+            <button
+              onClick={handleDownload}
+              disabled={!chunks || chunks.length === 0}
+              className="p-1 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-30"
+              title="Download all metrics as TSV"
+            >
+              <Download size={16} />
+            </button>
+          </div>
         </div>
 
         {/* Search */}
@@ -357,7 +658,7 @@ export default function MetricExplorerPanel() {
           />
         </div>
 
-        {/* Filters (auto-hide when not useful) */}
+        {/* Filters */}
         {(filterOptions.periodicity.length > 1 ||
           filterOptions.accounting_basis.length > 1 ||
           filterOptions.series_nature.length > 1) && (
@@ -384,28 +685,34 @@ export default function MetricExplorerPanel() {
         )}
       </div>
 
-      {/* Scrollable content */}
-      <div className="flex-1 overflow-auto explorer-scroll">
-        {isLoading && (
-          <div className="text-[12px] text-[var(--text-secondary)] text-center mt-8 animate-pulse">
-            Loading metrics...
-          </div>
-        )}
+      {/* Content area */}
+      {isLoading && (
+        <div className="text-[12px] text-[var(--text-secondary)] text-center mt-8 animate-pulse">
+          Loading metrics...
+        </div>
+      )}
 
-        {!isLoading && chunks !== null && filteredGroups.length === 0 && (
-          <div className="text-[12px] text-[var(--text-secondary)] text-center mt-8">
-            {searchQuery ? "No metrics match your search" : "No metric series found"}
-          </div>
-        )}
+      {!isLoading && chunks !== null && filteredGroups.length === 0 && (
+        <div className="text-[12px] text-[var(--text-secondary)] text-center mt-8">
+          {searchQuery ? "No metrics match your search" : "No metric series found"}
+        </div>
+      )}
 
-        {!isLoading && chunks === null && (
-          <div className="text-[12px] text-[var(--text-secondary)] text-center mt-8">
-            Switch to this tab to load metrics
-          </div>
-        )}
+      {!isLoading && chunks === null && (
+        <div className="text-[12px] text-[var(--text-secondary)] text-center mt-8">
+          Switch to this tab to load metrics
+        </div>
+      )}
 
-        {!isLoading &&
-          filteredGroups.map((group) => {
+      {/* Table view */}
+      {!isLoading && viewMode === "table" && filteredGroups.length > 0 && (
+        <TableView groups={filteredGroups} onNavigatePage={handleNavigatePage} />
+      )}
+
+      {/* List view */}
+      {!isLoading && viewMode === "list" && filteredGroups.length > 0 && (
+        <div className="flex-1 overflow-auto explorer-scroll" style={{ overflowX: "auto" }}>
+          {filteredGroups.map((group) => {
             const isCollapsed = collapsedPages.has(group.pageNumber);
             return (
               <div key={group.pageNumber}>
@@ -416,7 +723,7 @@ export default function MetricExplorerPanel() {
                 />
                 {!isCollapsed &&
                   group.rows.map((row) => {
-                    const currentFlatIdx = flatIdx++;
+                    const currentFlatIdx = flatIndexMap.get(row.chunkId) ?? -1;
                     return (
                       <LedgerRowComponent
                         key={row.chunkId}
@@ -424,6 +731,7 @@ export default function MetricExplorerPanel() {
                         isActive={activeRowIdx === currentFlatIdx}
                         isExpanded={expandedChunkId === row.chunkId}
                         onSelect={() => handleRowSelect(row, currentFlatIdx)}
+                        onCopyRow={() => handleCopyRow(row)}
                         rowRef={(el) => {
                           if (el) rowRefs.current.set(currentFlatIdx, el);
                           else rowRefs.current.delete(currentFlatIdx);
@@ -434,7 +742,11 @@ export default function MetricExplorerPanel() {
               </div>
             );
           })}
-      </div>
+        </div>
+      )}
+
+      {/* Sticky math footer */}
+      {!isLoading && flatRows.length > 0 && <MathFooter rows={flatRows} />}
     </div>
   );
 }

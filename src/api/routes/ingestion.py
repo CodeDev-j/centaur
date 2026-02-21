@@ -12,8 +12,9 @@ import hashlib
 import json
 import logging
 import shutil
+import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
@@ -175,12 +176,29 @@ async def ingest(file: UploadFile = File(...), force: bool = False):
         )
 
     # 1. Save uploaded file to inputs directory
-    dest = SystemPaths.INPUTS / file.filename
+    # Sanitize filename: strip path components to prevent directory traversal
+    safe_name = PurePosixPath(file.filename).name if file.filename else "upload"
+    safe_name = Path(safe_name).name  # Also handle Windows-style separators
+    if not safe_name or safe_name.startswith("."):
+        safe_name = "upload" + ext
+    # UUID prefix prevents race conditions on identical filenames
+    unique_name = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+    dest = SystemPaths.INPUTS / unique_name
     try:
         with open(dest, "wb") as f:
             shutil.copyfileobj(file.file, f)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+        logger.error(f"Failed to save uploaded file: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save file")
+
+    # Verify actual file size on disk (handles missing Content-Length header)
+    actual_size = dest.stat().st_size
+    if actual_size > _MAX_UPLOAD_BYTES:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({actual_size / 1024 / 1024:.0f} MB). Max: {_MAX_UPLOAD_BYTES // 1024 // 1024} MB",
+        )
 
     # 2. Compute doc_hash from file content (SHA256)
     doc_hash = hashlib.sha256(dest.read_bytes()).hexdigest()
@@ -192,15 +210,16 @@ async def ingest(file: UploadFile = File(...), force: bool = False):
                 existing = session.query(DocumentLedger).filter_by(doc_hash=doc_hash).first()
                 if existing and existing.status == "completed":
                     logger.info(
-                        f"Skipping ingestion for {file.filename} — "
+                        f"Skipping ingestion for {safe_name} — "
                         f"already completed (hash: {doc_hash[:12]}...)"
                     )
+                    dest.unlink(missing_ok=True)  # Remove duplicate file
                     return JSONResponse(
                         status_code=200,
                         content={
                             "status": "already_ingested",
                             "doc_hash": doc_hash,
-                            "filename": file.filename,
+                            "filename": safe_name,
                         },
                     )
         except Exception as db_err:
@@ -216,7 +235,7 @@ async def ingest(file: UploadFile = File(...), force: bool = False):
                 else:
                     session.add(DocumentLedger(
                         doc_hash=doc_hash,
-                        filename=file.filename,
+                        filename=safe_name,
                         status="processing",
                     ))
         except Exception as db_err:
@@ -231,7 +250,7 @@ async def ingest(file: UploadFile = File(...), force: bool = False):
         content={
             "status": "processing",
             "doc_hash": doc_hash,
-            "filename": file.filename,
+            "filename": safe_name,
         },
     )
 
@@ -321,7 +340,8 @@ async def list_documents():
                 for d in docs
             ]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to list documents: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list documents")
 
 
 @router.get("/documents/{doc_hash}", response_model=DocumentSummary)
@@ -344,4 +364,5 @@ async def get_document(doc_hash: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to get document: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get document")

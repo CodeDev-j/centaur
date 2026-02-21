@@ -4,7 +4,7 @@
 
 Centaur is a full-stack RAG engine purpose-built for high-finance document analysis. It ingests complex financial documents (CIMs, earnings slides, lender presentations, financial models), extracts structured data from charts and tables with forensic precision, and serves it through a cited conversational interface where every claim links back to its source.
 
-**Python 3.11+** | **Next.js 15** | **Docker** | **Postgres** | **Qdrant** | **LangGraph**
+**Python 3.11+** | **Next.js 16** | **Docker** | **Postgres** | **Qdrant** | **LangGraph**
 
 ---
 
@@ -56,16 +56,25 @@ Most RAG systems treat documents as flat text. Financial documents aren't flat t
     │   │  + Fine-Grained BBox Resolution       │                     │
     │   └──────────────┬────────────────────────┘                     │
     │                  │                                              │
+    │   PROMPT STUDIO                                                 │
+    │   ┌───────────────────────────────────────┐                     │
+    │   │  Saved Prompts (Jinja2 + versioning)  │                     │
+    │   │  Workflow Chains (sequential + HITL)   │                     │
+    │   │  4 Exec Modes (RAG/Structured/Direct/ │                     │
+    │   │  SQL) with retrieval caching           │                     │
+    │   └───────────────────────────────────────┘                     │
+    │                                                                 │
     └──────────────────┼──────────────────────────────────────────────┘
                        │
                        ▼
     ┌─────────────────────────────────────────────────────────────────┐
-    │   FastAPI  ──>  SSE Stream  ──>  Next.js UI                     │
-    │                                  ┌─────┬────────┬──────┐        │
-    │                                  │Docs │ PDF    │ Chat │        │
-    │                                  │List │ Viewer │Panel │        │
-    │                                  │     │ +BBox  │ +Cite│        │
-    │                                  └─────┴────────┴──────┘        │
+    │   FastAPI  ──>  SSE Stream  ──>  Next.js 16 + Zustand          │
+    │                    ┌─────┬────────┬───────────────────┐         │
+    │                    │Docs │ PDF    │ Chat | Inspect |  │         │
+    │                    │List │ Viewer │ Explorer | Studio │         │
+    │                    │     │ +BBox  │ (segmented tabs)  │         │
+    │                    │     │ +Zoom  │                   │         │
+    │                    └─────┴────────┴───────────────────┘         │
     └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -152,6 +161,10 @@ An LLM classifier routes each query to the optimal retrieval strategy:
 | **Qualitative** | Qdrant hybrid search only | "What are the key investment risks?" |
 | **Quantitative** | Text-to-SQL over `metric_facts` + light vector search | "What was EBITDA in Q3 2024?" |
 | **Hybrid** | Both paths, merged | "Why did revenue decline in Q3?" |
+
+### Document-Scoped Queries
+
+Users can scope queries to a single document via the doc-scope pill in the chat input. When active, a `doc_filter` (SHA-256 hash) is passed through the entire retrieval pipeline — both Qdrant hybrid search and Postgres Text-to-SQL respect the filter.
 
 ### Multilingual Query Expansion
 
@@ -277,22 +290,134 @@ For waterfalls and grouped bar charts, the system builds a spatial manifest of c
 
 ## The Frontend
 
-A three-panel Next.js application:
+A four-panel Next.js 16 application built on **Zustand** state management with **Geist** typography:
+
+```
+┌──────────┬──────────────────────┬──────────────────────┐
+│          │                      │ [Chat|Inspect|Explore│
+│  CENTAUR │                      │  r|Studio]           │
+│  ● Live  │                      │ ────────────────────│
+│          │                      │                      │
+│  doc1.pdf│    PDF Viewer        │  Chat Panel          │
+│  doc2.pdf│    + Zoom HUD        │  or Chunk Inspector  │
+│  doc3.pdf│    + BBox Overlay    │  or Metric Explorer  │
+│          │    + Citation Hl.    │  or Prompt Studio    │
+│          │                      │                      │
+│          │                      │                      │
+│ [Upload] │  [- 100% + | Fit]   │  [scope] [new topic] │
+└──────────┴──────────────────────┴──────────────────────┘
+  Sidebar       Center (Desk)         Right Panel Bay
+  (Collapsible)                       (Resizable)
+```
+
+### Panel Descriptions
 
 | Panel | Component | Function |
 |-------|-----------|----------|
-| **Left Sidebar** | `DocumentList` | Upload PDFs, browse ingested documents, status indicators |
-| **Center** | `DocumentViewer` | PDF.js page renderer with active citation highlight overlay |
-| **Right** | `ChatPanel` | Conversational interface with clickable `[N]` citation badges |
+| **Left Sidebar** | `DocumentList` | CENTAUR wordmark with status dot, document list with upload + drag-and-drop, SSE ingestion progress, collapsible (`PanelLeftClose`) |
+| **Center** | `DocumentViewer` | react-pdf renderer with floating zoom HUD (Ctrl+scroll), active citation bbox overlay, toolbar with page nav + sidebar toggle. Shows `WelcomeDropzone` when no document selected. |
+| **Right** | `RightPanel` | Segmented tab control (sliding indicator) hosting 4 sub-panels |
+
+### Right Panel Tabs
+
+| Tab | Component | Function |
+|-----|-----------|----------|
+| **Chat** | `ChatPanel` | Multi-turn conversational interface with SSE streaming (ghost bubble stepper), clickable `[N]` citation badges, doc-scope pill, "New topic" divider |
+| **Inspect** | `ChunkInspectorPanel` | Per-page chunk browser with type badges (visual/narrative/table), metadata inspector, value_bboxes count |
+| **Explorer** | `MetricExplorerPanel` | Structured metric ledger — page-grouped or flat table view, sortable columns, series parser with sparkline previews, TSV export |
+| **Studio** | `StudioPanel` + `WorkflowBuilder` | Prompt library with Jinja2 editor, version history, test run with retrieval caching, workflow chain builder with HITL approval |
+
+### State Management
+
+Five Zustand stores replace the original `useState` variables, each subscribed by specific slices to prevent waterfall re-renders:
+
+| Store | State | Subscribers |
+|-------|-------|-------------|
+| `useDocStore` | `documents[]`, `selectedDocHash`, `selectedFilename` | DocumentList, ChatPanel, page.tsx |
+| `useViewerStore` | `currentPage`, `numPages`, `zoomScale`, `renderedSize`, `sidebarCollapsed` | DocumentViewer, ChatPanel (citation nav) |
+| `useChatStore` | `messages[]`, `isThinking`, `docScope`, `citations`, `activeCitationIndex` | ChatPanel, BboxOverlay |
+| `useInspectStore` | `inspectMode`, `inspectChunks`, `activeChunkId`, `docStats`, `activePanel` | ChunkInspectorPanel, MetricExplorerPanel |
+| `useStudioStore` | `prompts[]`, `workflows[]`, `activePromptId`, `activeWorkflowId`, editor state | StudioPanel, WorkflowBuilder |
+
+### Streaming & Multi-Turn
+
+Chat uses **Server-Sent Events** (SSE) with a ghost bubble showing terminal-style progress:
+```
+[✓] Routed via hybrid
+[↻] Retrieving relevant chunks
+[ ] Generating answer
+```
+
+The last 6 messages are sent as conversation history for multi-turn context. A "New topic" button clears the conversation with a visual divider.
 
 ### Citation Interaction Flow
 
-1. User asks a question. The backend streams the answer via SSE with inline `[N]` markers.
-2. `ChatPanel` parses markers and renders them as blue clickable badges.
+1. User asks a question. The backend streams the answer via SSE with structured citation data.
+2. `ChatPanel` parses `[N]` markers and renders them as indigo clickable badges.
 3. User clicks badge `[1]`. The frontend reads `citation.doc_hash` to auto-select the document (if not already open), navigates `DocumentViewer` to the cited page, and renders a `BboxOverlay` highlight on the specific value or sentence.
 4. Only the **active citation** is highlighted — no visual clutter from other citations on the same page.
 
-The `BboxOverlay` component scales normalized 0-1 coordinates to pixel positions (`left = bbox.x * containerWidth`) with a small uniform padding (0.003 in normalized coords) for visual breathing room. The highlight uses a semi-transparent yellow fill with a thin red border — visible enough to locate the cited value without obscuring the underlying text.
+### Design Language
+
+"Machined Precision" — the DOM treated like milled aluminum:
+- **Z-axis depth hierarchy**: Sidebars cast `box-shadow` onto a recessed center desk (`--bg-desk: #050505`)
+- **Geist typography**: `GeistSans` for UI text, `GeistMono` for data and labels
+- **Subtractive interaction**: Buttons press down on `:active` (not glow up on hover)
+- **One-shot boot splash**: CENTAUR wordmark deblurs on first session load (sessionStorage-gated)
+- **Error boundary**: React class component wrapping DocumentViewer prevents blank-screen crashes
+
+---
+
+## Prompt Studio
+
+An integrated prompt engineering and workflow orchestration environment, decoupled from the chat router.
+
+### Saved Prompts
+
+- **Jinja2 templates** with `{{ variable }}` detection and a test-run sandbox
+- **Version history** with publish/draft lifecycle (only published versions appear in workflow step pickers)
+- **Retrieval caching**: First run retrieves from Qdrant and caches context for 5 minutes. Subsequent runs (prompt refinement) skip retrieval and regenerate from cached context. Manual "Re-retrieve" button available.
+
+### Workflow Chains
+
+- **Sequential executor** with Postgres checkpointing after each step
+- **HITL (Human-in-the-Loop)**: Step conditions can render to `"pause"` → workflow status becomes `paused_for_approval` → `/approve` endpoint resumes
+- **Input mapping**: Steps read from `{{ inputs.* }}` (user-provided) and `{{ steps.<step_name>.text }}` (output of prior steps)
+- **Step retry**: Configurable `retry_count` per step with auto-retry on failure
+- **Skip conditions**: Step condition renders to `"skip"` or `"false"` → step skipped
+
+### Four Execution Modes
+
+| Mode | Retrieval | Output | Use Case |
+|------|-----------|--------|----------|
+| `rag` | Qdrant hybrid search | Free text | Standard Q&A |
+| `structured` | Qdrant hybrid search | Pydantic JSON schema | Data extraction |
+| `direct` | None | Free text | Synthesis, reformatting |
+| `sql` | Text-to-SQL | JSON rows | Quantitative queries |
+
+---
+
+## Security
+
+### Hardening (Applied)
+
+| Layer | Threat | Mitigation |
+|-------|--------|------------|
+| **Template Injection** | Jinja2 SSTI via user-authored prompt templates | `SandboxedEnvironment` blocks `__class__`, `__mro__`, etc. |
+| **SQL Injection** | LLM-generated SQL with embedded DML | 3-layer defense: semicolon guard, SELECT-only guard, `SET TRANSACTION READ ONLY` |
+| **Path Traversal** | Crafted filenames like `../../etc/passwd` | `PurePosixPath(name).name` + `Path(name).name` strips all path components |
+| **Filename Race** | Concurrent uploads with identical filenames | UUID-prefixed unique filenames (`{uuid4()[:8]}_{safe_name}`) |
+| **Upload Size Bypass** | Missing `Content-Length` header skips size check | Post-save `stat()` verification on disk |
+| **Input Validation** | Oversized queries, malformed doc hashes | `max_length` on all string fields, regex patterns on `doc_filter` and `role` |
+| **Error Leaking** | Stack traces in HTTP responses | Generic error messages to clients; `exc_info=True` to server logs only |
+| **Unbounded Cache** | Module-level dict grows without limit | 256-entry max with LRU eviction |
+| **Auto-Reload** | `reload=True` in production exposes filesystem watcher | Conditional on `CENTAUR_DEV` environment variable |
+
+### Not Yet Implemented
+
+- **Authentication**: No auth middleware — all endpoints are open. Needs product decision (API keys vs OAuth2).
+- **User Isolation**: No tenant partitioning in Qdrant or Postgres. All documents share a single namespace.
+- **Concurrency Locks**: Module-level mutable state (`_retrieval_cache`, `_trackers`) lacks `asyncio.Lock` — low risk under CPython GIL but technically unsafe for check-and-set patterns.
 
 ---
 
@@ -306,12 +431,14 @@ The `BboxOverlay` component scales normalized 0-1 coordinates to pixel positions
 | **Sparse Search** | Qdrant native BM25 | Exact term matching with IDF weighting |
 | **Reranking** | Voyage Rerank 2.5 | Cross-encoder precision layer (optional) |
 | **Vector DB** | Qdrant | Hybrid search with RRF fusion |
-| **SQL DB** | PostgreSQL 15 | Document ledger + `metric_facts` analytics |
+| **SQL DB** | PostgreSQL 15 | Document ledger + `metric_facts` analytics + Studio tables |
+| **Migrations** | Alembic | Schema versioning for Studio tables |
 | **Table Extraction** | IBM Docling v2 | HTML table extraction with row hierarchy |
 | **OCR** | RapidOCR (ONNX) | Fallback for rasterized chart images |
 | **Orchestration** | LangGraph | Stateful query routing and generation workflow |
 | **API** | FastAPI | REST + SSE streaming endpoints |
-| **Frontend** | Next.js 15 + Tailwind | Three-panel document intelligence UI |
+| **Frontend** | Next.js 16 + Tailwind + Zustand | Four-panel document intelligence UI |
+| **Typography** | Geist Sans + Geist Mono | Financial-grade crisp rendering |
 | **Observability** | LangSmith | Full trace visibility on every pipeline step |
 
 ---
@@ -328,7 +455,7 @@ centaur/
 │   │   ├── router.py                      # File type classification
 │   │   ├── pdf_parser.py                  # Two-phase VLM pipeline (Glance + Read)
 │   │   ├── native_parser.py               # Excel/PPTX extraction
-│   │   ├── chunker.py                     # UnifiedDocument -> IndexableChunks
+│   │   ├── chunker.py                     # UnifiedDocument -> IndexableChunks + value_bboxes
 │   │   ├── filters.py                     # Token firewall (noise stripping)
 │   │   └── phantom.py                     # Shadow PDF generation (Playwright)
 │   │
@@ -341,7 +468,9 @@ centaur/
 │   │   ├── vector_driver.py               # Qdrant hybrid index (Cohere + BM25 + RRF)
 │   │   ├── analytics_driver.py            # Postgres metric_facts (structured analytics)
 │   │   ├── db_driver.py                   # Postgres document ledger
-│   │   └── blob_driver.py                 # Local artifact store
+│   │   ├── blob_driver.py                 # Local artifact store
+│   │   ├── studio_models.py               # ORM models for Prompt Studio (6 tables)
+│   │   └── studio_driver.py               # Full CRUD for prompts, workflows, runs
 │   │
 │   ├── schemas/                           # TYPE CONTRACTS
 │   │   ├── deal_stream.py                 # UnifiedDocument, DocItem union
@@ -356,18 +485,23 @@ centaur/
 │   ├── workflows/                         # LANGGRAPH BRAIN
 │   │   ├── graph.py                       # Graph assembly (route -> retrieve -> generate)
 │   │   ├── router.py                      # Query classifier (qual/quant/hybrid + locale)
+│   │   ├── prompt_executor.py             # Decoupled Studio execution (4 modes, Jinja2 sandbox)
+│   │   ├── workflow_executor.py           # Sequential workflow runner with HITL + checkpointing
 │   │   └── nodes/
 │   │       ├── retrieve.py                # Retrieval nodes (qualitative, quantitative, hybrid)
 │   │       ├── financial_math.py          # Text-to-SQL over metric_facts
-│   │       └── generate.py                # Structured output generation + fact-based citation assembly
+│   │       ├── generate.py                # Structured output generation + citation assembly
+│   │       └── legal_reasoning.py         # Legal analysis node
 │   │
 │   ├── api/                               # FASTAPI SERVER
 │   │   ├── main.py                        # App setup, CORS, startup initialization
-│   │   ├── schemas.py                     # Request/response models
+│   │   ├── schemas.py                     # Request/response models (validated)
 │   │   └── routes/
 │   │       ├── chat.py                    # POST /chat, POST /chat/stream (SSE)
 │   │       ├── ingestion.py               # POST /ingest, GET /documents
-│   │       └── documents.py               # Page image rendering, region overlays
+│   │       ├── documents.py               # PDF serving, page rendering, chunk inspection
+│   │       ├── prompts.py                 # Prompt CRUD + publish + test run (9 endpoints)
+│   │       └── workflows.py               # Workflow CRUD + steps + run + approve (14 endpoints)
 │   │
 │   └── tools/                             # VLM TOOLS
 │       ├── layout_analyzer.py             # Phase 1: Object detection (Glance)
@@ -376,19 +510,43 @@ centaur/
 │       ├── database.py                    # SQL lookup tool
 │       └── vision.py                      # GPT-4o visual analysis
 │
-├── frontend/                              # NEXT.JS UI
+├── frontend/                              # NEXT.JS 16 UI
 │   └── src/
 │       ├── app/
-│       │   ├── layout.tsx                 # Root layout
-│       │   ├── page.tsx                   # Three-panel app shell
-│       │   └── globals.css                # Dark theme, bbox overlay styles
+│       │   ├── layout.tsx                 # Root layout (Geist fonts, BootSplash)
+│       │   ├── page.tsx                   # Four-panel app shell + Zustand subscriptions
+│       │   └── globals.css                # Material depth theme, animations, typography scale
 │       ├── components/
-│       │   ├── ChatPanel.tsx              # Chat with clickable citation badges
-│       │   ├── DocumentViewer.tsx         # PDF.js viewer with bbox overlays
-│       │   ├── DocumentList.tsx           # Sidebar with upload
-│       │   └── BboxOverlay.tsx            # Pixel-precise citation highlight
+│       │   ├── DocumentViewer.tsx          # react-pdf + zoom HUD + Ctrl+scroll + sidebar toggle
+│       │   ├── DocumentList.tsx            # Sidebar: CENTAUR wordmark, upload, SSE status
+│       │   ├── ChatPanel.tsx              # SSE streaming, ghost bubble, citations, multi-turn
+│       │   ├── ChunkInspectorPanel.tsx    # Per-page chunk browser with type badges
+│       │   ├── MetricExplorerPanel.tsx    # Structured metric ledger with sparklines
+│       │   ├── StudioPanel.tsx            # Prompt editor, version history, test sandbox
+│       │   ├── WorkflowBuilder.tsx        # Workflow chain builder with step stepper
+│       │   ├── RightPanel.tsx             # Segmented tab control + resize handle
+│       │   ├── WelcomeDropzone.tsx        # Center empty state with drag-and-drop upload
+│       │   ├── BootSplash.tsx             # One-shot wordmark animation (sessionStorage-gated)
+│       │   ├── BboxOverlay.tsx            # Pixel-precise citation highlight
+│       │   ├── MiniSparkline.tsx          # Inline SVG sparkline for metric trends
+│       │   └── ErrorBoundary.tsx          # React class error boundary for crash recovery
+│       ├── stores/
+│       │   ├── useDocStore.ts             # Document selection state
+│       │   ├── useViewerStore.ts          # PDF viewer state (persisted sidebar)
+│       │   ├── useChatStore.ts            # Chat messages, streaming, citations
+│       │   ├── useInspectStore.ts         # Chunk inspection + panel routing
+│       │   └── useStudioStore.ts          # Prompt Studio state
+│       ├── hooks/
+│       │   └── useKeyboardShortcuts.ts    # Global keyboard shortcuts (1-4 for tabs)
 │       └── lib/
-│           └── api.ts                     # API client
+│           ├── api.ts                     # Full API client (REST + SSE streaming)
+│           ├── tsvExport.ts               # Metric Explorer → clipboard/file export
+│           └── seriesParser.ts            # MetricSeries text → structured data parser
+│
+├── alembic/                               # DATABASE MIGRATIONS
+│   ├── env.py
+│   └── versions/
+│       └── 6e2e4d9c0fd6_create_studio_tables.py
 │
 ├── data/                                  # DATA LAKE (gitignored)
 │   ├── inputs/                            # Raw document drop zone
@@ -429,6 +587,8 @@ Add your API keys to `.env`:
 OPENAI_API_KEY=sk-...          # Required — GPT-4.1 for VLM + generation
 COHERE_API_KEY=...             # Required — embed-v4 for vector search
 VOYAGE_API_KEY=...             # Optional — rerank-2.5 for precision
+POSTGRES_PASSWORD=...          # Recommended — defaults to "password" with a warning
+CENTAUR_DEV=true               # Optional — enables uvicorn auto-reload
 ```
 
 Where to get keys:
@@ -447,11 +607,17 @@ cd frontend
 npm install
 ```
 
-### 4. Run
+### 4. Run Database Migrations
+
+```bash
+alembic upgrade head
+```
+
+### 5. Run
 
 Terminal 1 — Backend:
 ```bash
-uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000
 ```
 
 Terminal 2 — Frontend:
@@ -462,9 +628,9 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
-### 5. Ingest a Document
+### 6. Ingest a Document
 
-Upload a PDF through the UI, or run manually:
+Upload a PDF through the UI (drag-and-drop on the center dropzone, or click to browse), or run manually:
 
 ```bash
 python run_ingestion.py
@@ -498,6 +664,10 @@ All extracted insights are classified into five categories:
 
 5. **Separation of Concerns.** The VLM captures raw visual data. Python handles all transformations, normalization, and calculations. This minimizes hallucination and maximizes auditability.
 
+6. **Sandboxed Execution.** User-authored Jinja2 templates run in `SandboxedEnvironment`. LLM-generated SQL runs in `READ ONLY` transactions with multi-statement guards.
+
+7. **Defense in Depth.** Security-sensitive paths (SQL execution, file upload, template rendering) have multiple independent guards — if one fails, the next catches it.
+
 ---
 
 ## Observability
@@ -510,7 +680,7 @@ LANGCHAIN_API_KEY=lsv2_...
 LANGCHAIN_PROJECT=Chiron_Adv_RAG
 ```
 
-Traced functions: layout analysis, visual extraction, document chunking, embedding, hybrid search, query expansion, reranking, Text-to-SQL, answer generation, citation verification.
+Traced functions: layout analysis, visual extraction, document chunking, embedding, hybrid search, query expansion, reranking, Text-to-SQL, answer generation, citation verification, prompt execution, workflow runs.
 
 ---
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { ClipboardCopy } from "lucide-react";
 import { useInspectStore } from "@/stores/useInspectStore";
 import { useViewerStore } from "@/stores/useViewerStore";
@@ -147,40 +147,116 @@ function ChunkCard({
   );
 }
 
+// ─── Page Group Header ────────────────────────────────────────────────
+
+function PageGroupHeader({
+  pageNumber,
+  chunkCount,
+  isCurrent,
+}: {
+  pageNumber: number;
+  chunkCount: number;
+  isCurrent: boolean;
+}) {
+  return (
+    <div
+      className={`sticky top-0 z-10 flex items-center gap-2 px-1 py-1.5 text-xs font-medium ${
+        isCurrent
+          ? "text-[var(--accent)]"
+          : "text-[var(--text-secondary)]"
+      }`}
+      style={{ background: "var(--bg-panel)" }}
+    >
+      <div className="h-px flex-1 bg-[var(--border-sharp)]" />
+      <span className="shrink-0">
+        Page {pageNumber}
+        <span className="font-normal opacity-70"> &middot; {chunkCount}</span>
+      </span>
+      <div className="h-px flex-1 bg-[var(--border-sharp)]" />
+    </div>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────
+
 export default function ChunkInspectorPanel() {
-  const chunks = useInspectStore((s) => s.inspectChunks);
+  const allChunks = useInspectStore((s) => s.inspectAllChunks);
   const docStats = useInspectStore((s) => s.docStats);
   const activeChunkId = useInspectStore((s) => s.activeChunkId);
   const setActiveChunkId = useInspectStore((s) => s.setActiveChunkId);
+  const typeFilter = useInspectStore((s) => s.inspectTypeFilter);
+  const toggleType = useInspectStore((s) => s.toggleInspectType);
   const isLoading = useInspectStore((s) => s.inspectLoading);
   const currentPage = useViewerStore((s) => s.currentPage);
 
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
 
+  // Filter chunks by active type filter
+  const filtered = useMemo(() => {
+    if (!allChunks) return [];
+    if (typeFilter.length === 0) return allChunks;
+    return allChunks.filter((c) => typeFilter.includes(c.item_type));
+  }, [allChunks, typeFilter]);
+
+  // Group filtered chunks by page number
+  const pageGroups = useMemo(() => {
+    const groups = new Map<number, ChunkDetail[]>();
+    for (const chunk of filtered) {
+      const existing = groups.get(chunk.page_number) ?? [];
+      existing.push(chunk);
+      groups.set(chunk.page_number, existing);
+    }
+    return [...groups.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([pageNumber, chunks]) => ({ pageNumber, chunks }));
+  }, [filtered]);
+
+  const handleSelectChunk = useCallback((chunk: ChunkDetail) => {
+    const { activeChunkId: currentId, setActiveChunkId: setId } = useInspectStore.getState();
+    if (currentId === chunk.chunk_id) {
+      setId(null);
+      return;
+    }
+    setId(chunk.chunk_id);
+    // Navigate to the chunk's page if different from current
+    const { currentPage: viewerPage } = useViewerStore.getState();
+    if (chunk.page_number !== viewerPage) {
+      useViewerStore.getState().setCurrentPage(chunk.page_number);
+    }
+  }, []);
+
   const handleCopyTsv = useCallback(async () => {
-    if (!chunks || chunks.length === 0) return;
-    const ok = await copyTsvToClipboard(chunks);
+    if (filtered.length === 0) return;
+    const ok = await copyTsvToClipboard(filtered);
     setCopyFeedback(ok ? "Copied!" : "Failed");
     setTimeout(() => setCopyFeedback(null), 2000);
-  }, [chunks]);
+  }, [filtered]);
+
+  const isFiltered = typeFilter.length > 0;
 
   return (
     <div className="flex flex-col h-full">
-      <div className="px-4 py-3 border-b border-[var(--border)] space-y-1">
+      <div className="px-4 py-3 border-b border-[var(--border)] space-y-2">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold">
-            Page {currentPage}
-            {chunks && (
-              <span className="font-normal text-[var(--text-secondary)]">
-                {" "}&mdash; {chunks.length} chunk{chunks.length !== 1 ? "s" : ""}
-              </span>
+            {isFiltered ? (
+              <>
+                {filtered.length} chunk{filtered.length !== 1 ? "s" : ""}
+                <span className="font-normal text-[var(--text-secondary)]">
+                  {" "}&mdash; filtered
+                </span>
+              </>
+            ) : (
+              <>
+                {allChunks ? allChunks.length : 0} chunks
+              </>
             )}
           </h3>
-          {chunks && chunks.length > 0 && (
+          {filtered.length > 0 && (
             <button
               onClick={handleCopyTsv}
               className="p-1 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] relative"
-              title="Copy page chunks as TSV (Ctrl+Shift+C)"
+              title="Copy visible chunks as TSV"
             >
               <ClipboardCopy size={14} />
               {copyFeedback && (
@@ -192,55 +268,75 @@ export default function ChunkInspectorPanel() {
           )}
         </div>
 
+        {/* Clickable type filter badges */}
         {docStats && (
           <div className="flex flex-wrap gap-1.5">
             {Object.entries(docStats.by_type).map(([type, count]) => {
               const style = TYPE_COLORS[type] || { bg: "#66666620", text: "#666", label: type };
+              const isActive = typeFilter.includes(type);
+              const isDimmed = isFiltered && !isActive;
+
               return (
-                <span
+                <button
                   key={type}
-                  className="text-[10px] px-1.5 py-0.5 rounded"
-                  style={{ backgroundColor: style.bg, color: style.text }}
+                  onClick={() => toggleType(type)}
+                  className="text-[10px] px-1.5 py-0.5 rounded transition-all duration-100 cursor-pointer"
+                  style={{
+                    backgroundColor: isDimmed ? "transparent" : style.bg,
+                    color: isDimmed ? "var(--text-muted)" : style.text,
+                    border: isDimmed
+                      ? "1px solid var(--border-subtle)"
+                      : isActive
+                        ? `1px solid ${style.text}40`
+                        : "1px solid transparent",
+                  }}
                 >
                   {count} {style.label}
-                </span>
+                </button>
               );
             })}
           </div>
         )}
       </div>
 
-      <div className="flex-1 overflow-auto p-3 space-y-2">
+      <div className="flex-1 overflow-auto p-3 space-y-1">
         {isLoading && (
           <div className="text-sm text-[var(--text-secondary)] text-center mt-8 animate-pulse">
             Loading chunks...
           </div>
         )}
 
-        {!isLoading && chunks && chunks.length === 0 && (
+        {!isLoading && allChunks && filtered.length === 0 && (
           <div className="text-sm text-[var(--text-secondary)] text-center mt-8">
-            No chunks indexed for this page
+            {isFiltered ? "No chunks match the selected filters" : "No chunks indexed for this document"}
           </div>
         )}
 
-        {!isLoading && !chunks && (
+        {!isLoading && !allChunks && (
           <div className="text-sm text-[var(--text-secondary)] text-center mt-8">
             Select a document to inspect chunks
           </div>
         )}
 
         {!isLoading &&
-          chunks?.map((chunk) => (
-            <ChunkCard
-              key={chunk.chunk_id}
-              chunk={chunk}
-              isActive={activeChunkId === chunk.chunk_id}
-              onSelect={() =>
-                setActiveChunkId(
-                  activeChunkId === chunk.chunk_id ? null : chunk.chunk_id
-                )
-              }
-            />
+          pageGroups.map(({ pageNumber, chunks }) => (
+            <div key={pageNumber}>
+              <PageGroupHeader
+                pageNumber={pageNumber}
+                chunkCount={chunks.length}
+                isCurrent={pageNumber === currentPage}
+              />
+              <div className="space-y-2 mb-3">
+                {chunks.map((chunk) => (
+                  <ChunkCard
+                    key={chunk.chunk_id}
+                    chunk={chunk}
+                    isActive={activeChunkId === chunk.chunk_id}
+                    onSelect={() => handleSelectChunk(chunk)}
+                  />
+                ))}
+              </div>
+            </div>
           ))}
       </div>
     </div>

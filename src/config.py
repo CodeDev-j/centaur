@@ -54,6 +54,15 @@ class SystemConfig:
     # === Infrastructure (Postgres — matches docker-compose.yml) ===
     POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
     POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
+
+    @classmethod
+    def _check_defaults(cls):
+        """Warn about insecure defaults at startup."""
+        if cls.POSTGRES_PASSWORD == "password":
+            logger.warning(
+                "POSTGRES_PASSWORD is using the default value. "
+                "Set POSTGRES_PASSWORD in .env for production."
+            )
     POSTGRES_DB = os.getenv("POSTGRES_DB", "chiron_ledger")
     POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
     POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")

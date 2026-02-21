@@ -152,7 +152,6 @@ export default function DocumentList() {
             }}
             className="p-1 rounded hover:bg-[var(--bg-tertiary)]"
             title="Refresh"
-            suppressHydrationWarning
           >
             <RefreshCw size={14} className={isLoading ? "animate-spin" : ""} />
           </button>
@@ -161,7 +160,6 @@ export default function DocumentList() {
             className="p-1 rounded hover:bg-[var(--bg-tertiary)]"
             title="Upload"
             disabled={isUploading}
-            suppressHydrationWarning
           >
             <Upload size={14} />
           </button>
@@ -172,7 +170,6 @@ export default function DocumentList() {
           accept=".pdf,.xlsx,.xls,.csv"
           onChange={handleUpload}
           className="hidden"
-          suppressHydrationWarning
         />
       </div>
 
@@ -213,7 +210,7 @@ export default function DocumentList() {
                   {statusLabel(doc.status)}
                   {doc.upload_date &&
                     doc.status !== "processing" &&
-                    ` · ${new Date(doc.upload_date).toLocaleDateString()}`}
+                    ` · ${new Date(doc.upload_date).toISOString().slice(0, 10)}`}
                 </p>
               </div>
             </div>

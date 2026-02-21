@@ -14,6 +14,7 @@ const FEATURES = [
 export default function WelcomeDropzone() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounter = useRef(0);
 
@@ -22,12 +23,14 @@ export default function WelcomeDropzone() {
     if (!file) return;
 
     setIsUploading(true);
+    setUploadError(null);
     try {
       await uploadDocument(file);
       const docs = await listDocuments();
       useDocStore.getState().setDocuments(docs);
     } catch (err) {
       console.error("Upload failed:", err);
+      setUploadError(err instanceof Error ? err.message : "Upload failed");
     } finally {
       setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -77,41 +80,68 @@ export default function WelcomeDropzone() {
         onClick={() => fileInputRef.current?.click()}
         disabled={isUploading}
         className={`
-          w-full max-w-lg rounded-xl border border-dashed p-10
+          w-full max-w-lg rounded-md p-10
           flex flex-col items-center gap-6
-          transition-all duration-200 cursor-pointer
+          transition-all duration-100 cursor-pointer
           ${isDragOver
-            ? "border-[var(--accent)] bg-[rgba(79,70,229,0.05)] shadow-[inset_0_0_0_2px_var(--accent)]"
-            : "border-[var(--border-subtle)] hover:border-[var(--border-sharp)]"
+            ? "bg-[var(--bg-surface)] border border-solid border-[var(--accent)]"
+            : "bg-[var(--bg-panel)] border border-dashed border-[#333333] hover:border-[#444444]"
           }
           ${isUploading ? "opacity-50 pointer-events-none" : ""}
         `}
       >
-        {/* Wordmark */}
-        <h1 className="text-h1 text-[var(--text-primary)]">CENTAUR</h1>
+        {/* Wordmark — recessed watermark (sidebar owns the bright brand mark) */}
+        <span
+          className="text-[var(--text-watermark)]"
+          style={{
+            fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            fontSize: "12px",
+            fontWeight: 500,
+            letterSpacing: "0.25em",
+            textTransform: "uppercase" as const,
+          }}
+        >
+          CENTAUR
+        </span>
 
-        {/* Instruction */}
+        {/* Primary instruction — the focal point */}
         <div className="text-center">
-          <p className="text-caption text-[var(--text-secondary)]">
+          <p className="text-[16px] text-[var(--text-primary)]" style={{ fontFamily: "var(--font-geist-sans), sans-serif" }}>
             {isUploading ? "Uploading..." : "Drag & drop financial documents here"}
           </p>
-          {!isUploading && (
-            <p className="text-caption text-[var(--text-secondary)] mt-1 opacity-60">
+          {!isUploading && !uploadError && (
+            <p className="text-[13px] text-[#888888] mt-1" style={{ fontFamily: "var(--font-geist-sans), sans-serif" }}>
               or click to browse
+            </p>
+          )}
+          {uploadError && (
+            <p className="text-[13px] text-red-400 mt-1">
+              {uploadError}
             </p>
           )}
         </div>
 
-        {/* Divider */}
-        <div className="w-16 h-px bg-[var(--border-subtle)]" />
+        {/* Divider — solid hex, no opacity */}
+        <div className="w-16 h-px bg-[#222222]" />
 
-        {/* Feature grid */}
+        {/* Feature grid — solid hex colors throughout */}
         <div className="grid grid-cols-3 gap-6 w-full">
           {FEATURES.map(({ icon: Icon, title, desc }) => (
             <div key={title} className="flex flex-col items-center text-center gap-2">
-              <Icon size={18} className="text-[var(--text-secondary)] opacity-60" />
-              <span className="text-h2 text-[var(--text-secondary)]">{title}</span>
-              <span className="text-caption text-[var(--text-secondary)] opacity-50 leading-tight">
+              <Icon size={16} strokeWidth={1.5} className="text-[var(--text-muted)]" />
+              <span
+                className="text-[var(--text-secondary)]"
+                style={{
+                  fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+                  fontSize: "12px",
+                  fontWeight: 500,
+                  letterSpacing: "0.05em",
+                  textTransform: "uppercase" as const,
+                }}
+              >
+                {title}
+              </span>
+              <span className="text-[13px] text-[var(--text-tertiary)] leading-relaxed" style={{ fontFamily: "var(--font-geist-sans), sans-serif" }}>
                 {desc}
               </span>
             </div>
