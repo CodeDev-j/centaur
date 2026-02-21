@@ -1,10 +1,11 @@
 """
 Query Router: Classifies incoming queries for optimal retrieval strategy.
 
-Routes to one of three paths:
-- qualitative:  Free-text Q&A → Qdrant hybrid search
-- quantitative:  Numeric/comparison queries → Text-to-SQL over metric_facts
-- hybrid:        Both paths, merged results
+Routes to one of four paths:
+- qualitative:     Free-text Q&A → Qdrant hybrid search
+- quantitative:    Numeric/comparison queries → Text-to-SQL over metric_facts
+- hybrid:          Both paths, merged results
+- visualization:   Chart/graph requests → Text-to-SQL → Vega-Lite spec
 
 Also detects query locale (en/de/fr) for multilingual expansion.
 """
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 _ROUTER_PROMPT = """You are a financial query classifier. Given a user query, output exactly two lines:
 
-Line 1 - ROUTE: one of [qualitative, quantitative, hybrid]
+Line 1 - ROUTE: one of [qualitative, quantitative, hybrid, visualization]
 Line 2 - LOCALE: one of [en, de, fr]
 
 Classification rules:
@@ -29,6 +30,9 @@ Classification rules:
   Examples: "What was revenue in 2024?", "Which company has highest EBITDA margin?"
 - "hybrid": Queries that need both numbers AND context/explanation.
   Examples: "Why did revenue decline in Q3?", "Compare margins and explain drivers"
+- "visualization": Queries explicitly requesting a chart, graph, plot, or visual data representation.
+  Examples: "Chart revenue by quarter", "Plot EBITDA margin over time", "Show me a bar chart",
+  "Graph the trend of operating income", "Visualize margins for all companies"
 
 Locale detection:
 - "de" if the query is primarily in German
@@ -65,7 +69,7 @@ async def route_query(state: AgentState) -> dict:
             line = line.strip().lower()
             if line.startswith("route:"):
                 r = line.split(":", 1)[1].strip()
-                if r in ("qualitative", "quantitative", "hybrid"):
+                if r in ("qualitative", "quantitative", "hybrid", "visualization"):
                     route = r
             elif line.startswith("locale:"):
                 loc = line.split(":", 1)[1].strip()

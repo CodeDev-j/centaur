@@ -1,12 +1,15 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { FileText, Upload, RefreshCw, Loader2 } from "lucide-react";
+import { FileText, Upload, RefreshCw, Loader2, Download, AlertTriangle, AlertCircle, Info } from "lucide-react";
 import {
   listDocuments,
   uploadDocument,
   getIngestStatusUrl,
+  fetchAuditSummary,
+  downloadExcel,
   DocumentSummary,
+  AuditSummary,
 } from "@/lib/api";
 import { useDocStore } from "@/stores/useDocStore";
 import { useViewerStore } from "@/stores/useViewerStore";
@@ -22,6 +25,7 @@ export default function DocumentList() {
   const setIsUploading = useDocStore((s) => s.setIsUploading);
 
   const [isLoading, setIsLoading] = useState(false);
+  const [auditSummaries, setAuditSummaries] = useState<Record<string, AuditSummary>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   const eventSourcesRef = useRef<Map<string, EventSource>>(new Map());
 
@@ -67,7 +71,19 @@ export default function DocumentList() {
 
   useEffect(() => {
     setIsLoading(true);
-    refresh().finally(() => setIsLoading(false));
+    refresh()
+      .then((docs) => {
+        // Fetch audit summaries for all completed documents
+        const completed = (docs || []).filter((d) => d.status === "completed");
+        completed.forEach((doc) => {
+          fetchAuditSummary(doc.doc_hash)
+            .then((summary) => {
+              setAuditSummaries((prev) => ({ ...prev, [doc.doc_hash]: summary }));
+            })
+            .catch(() => { /* non-critical */ });
+        });
+      })
+      .finally(() => setIsLoading(false));
   }, [refresh]);
 
   useEffect(() => {
@@ -204,8 +220,29 @@ export default function DocumentList() {
                   className="mt-0.5 shrink-0 text-[var(--text-secondary)]"
                 />
               )}
-              <div className="min-w-0">
-                <p className="text-sm truncate">{doc.filename}</p>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <p className="text-sm truncate flex-1">{doc.filename}</p>
+                  {/* Audit severity badge */}
+                  {auditSummaries[doc.doc_hash] && (
+                    <AuditBadge summary={auditSummaries[doc.doc_hash]} />
+                  )}
+                  {/* Excel export button */}
+                  {doc.status === "completed" && (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        downloadExcel(doc.doc_hash, doc.filename);
+                      }}
+                      className="p-0.5 rounded hover:bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+                      title="Export to Excel"
+                    >
+                      <Download size={12} />
+                    </span>
+                  )}
+                </div>
                 <p className="text-xs text-[var(--text-secondary)] mt-0.5">
                   {statusLabel(doc.status)}
                   {doc.upload_date &&
@@ -224,5 +261,32 @@ export default function DocumentList() {
         )}
       </div>
     </div>
+  );
+}
+
+/** Small severity dot: red (errors) > amber (warnings) > green (clean) */
+function AuditBadge({ summary }: { summary: AuditSummary }) {
+  const total = summary.error + summary.warning + summary.info;
+  if (total === 0) {
+    return (
+      <span
+        className="w-2 h-2 rounded-full bg-green-500 shrink-0"
+        title="No audit findings"
+      />
+    );
+  }
+  if (summary.error > 0) {
+    return (
+      <span
+        className="w-2 h-2 rounded-full bg-red-500 shrink-0"
+        title={`${summary.error} errors, ${summary.warning} warnings`}
+      />
+    );
+  }
+  return (
+    <span
+      className="w-2 h-2 rounded-full bg-amber-500 shrink-0"
+      title={`${summary.warning} warnings, ${summary.info} info`}
+    />
   );
 }

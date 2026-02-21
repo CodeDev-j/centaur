@@ -2,8 +2,9 @@
 
 import { useRef, useEffect, useCallback } from "react";
 import { Send, X, Globe, FileText, Eraser, Check, Loader2, Circle } from "lucide-react";
-import { streamChat, ChatMessagePayload } from "@/lib/api";
+import { streamChat, ChatMessagePayload, VizPayload } from "@/lib/api";
 import { useChatStore, ChatMessage, StreamStep } from "@/stores/useChatStore";
+import ChatVizBlock from "./ChatVizBlock";
 import { useDocStore } from "@/stores/useDocStore";
 import { useViewerStore } from "@/stores/useViewerStore";
 import { useInspectStore } from "@/stores/useInspectStore";
@@ -93,6 +94,7 @@ export default function ChatPanel() {
     let finalAnswer = "";
     let finalCitations: typeof citations = [];
     let routeValue = "";
+    let vizPayload: VizPayload | undefined;
 
     // R2 fix: cancel any in-flight stream before starting new one
     activeStreamRef.current?.cancel();
@@ -122,6 +124,15 @@ export default function ChatPanel() {
               { label: "Generating answer", status: "active" },
             ],
           });
+        } else if (event.type === "viz") {
+          vizPayload = event.content as VizPayload;
+          chatStore.updateLastAssistant({
+            streamSteps: [
+              { label: `Routed via visualization`, status: "done" },
+              { label: "Data retrieved", status: "done" },
+              { label: "Rendering chart", status: "active" },
+            ],
+          });
         } else if (event.type === "citations") {
           finalCitations = event.content as typeof citations;
         } else if (event.type === "error") {
@@ -146,7 +157,15 @@ export default function ChatPanel() {
 
     // Replace ghost bubble with final answer
     const chatStore = useChatStore.getState();
-    if (finalAnswer) {
+    if (vizPayload) {
+      chatStore.updateLastAssistant({
+        content: finalAnswer || "",
+        viz: vizPayload,
+        route: "visualization",
+        isStreaming: false,
+        streamSteps: undefined,
+      });
+    } else if (finalAnswer) {
       chatStore.updateLastAssistant({
         content: finalAnswer,
         citations: finalCitations.length > 0 ? finalCitations : undefined,
@@ -208,11 +227,21 @@ export default function ChatPanel() {
                 <span>{msg.content.replace(/^---\s*/, "").replace(/\s*---$/, "")}</span>
               ) : (
                 <>
-                  <MessageContent
-                    content={msg.content}
-                    citations={msg.citations}
-                    onCitationClick={handleCitationClick}
-                  />
+                  {msg.viz && (
+                    <ChatVizBlock
+                      spec={msg.viz.spec}
+                      data={msg.viz.data}
+                      sql={msg.viz.sql}
+                      title={msg.viz.title}
+                    />
+                  )}
+                  {msg.content && (
+                    <MessageContent
+                      content={msg.content}
+                      citations={msg.citations}
+                      onCitationClick={handleCitationClick}
+                    />
+                  )}
                   {msg.route && (
                     <div className="mt-1 text-xs opacity-60">
                       Route: {msg.route}

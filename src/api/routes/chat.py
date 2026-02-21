@@ -53,6 +53,10 @@ def _build_initial_state(request: ChatRequest) -> dict:
         "final_answer": "",
         "citations": [],
         "confidence": 0.0,
+        "viz_spec": None,
+        "viz_data": None,
+        "viz_sql": None,
+        "viz_title": None,
     }
 
 
@@ -109,6 +113,22 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                 for node_name, node_output in chunk.items():
                     if node_name == "route_query":
                         yield f"data: {json.dumps({'type': 'route', 'content': node_output}, default=str)}\n\n"
+
+                    elif node_name == "visualize":
+                        # Visualization terminal node — emit viz event
+                        viz_spec = node_output.get("viz_spec")
+                        if viz_spec:
+                            try:
+                                yield f"data: {json.dumps({'type': 'viz', 'content': {'spec': viz_spec, 'data': node_output.get('viz_data', []), 'sql': node_output.get('viz_sql', ''), 'title': node_output.get('viz_title', '')}}, default=str)}\n\n"
+                            except Exception as ve:
+                                logger.error(f"Viz serialization failed: {ve}", exc_info=True)
+                        # Also emit any fallback text answer
+                        answer = node_output.get("final_answer", "")
+                        if answer:
+                            yield f"data: {json.dumps({'type': 'answer', 'content': answer})}\n\n"
+                        # Emit data as table fallback if spec failed but data exists
+                        if not viz_spec and node_output.get("viz_data"):
+                            yield f"data: {json.dumps({'type': 'viz', 'content': {'spec': None, 'data': node_output.get('viz_data', []), 'sql': node_output.get('viz_sql', ''), 'title': node_output.get('viz_title', '')}}, default=str)}\n\n"
 
                     elif node_name == "generate_answer":
                         answer = node_output.get("final_answer", "")

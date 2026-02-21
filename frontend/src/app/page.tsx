@@ -10,7 +10,7 @@ import { useDocStore } from "@/stores/useDocStore";
 import { useViewerStore } from "@/stores/useViewerStore";
 import { useChatStore } from "@/stores/useChatStore";
 import { useInspectStore } from "@/stores/useInspectStore";
-import { fetchDocChunks, fetchDocStats } from "@/lib/api";
+import { fetchDocChunks, fetchDocStats, listDocuments } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 
 export default function Home() {
@@ -25,6 +25,35 @@ export default function Home() {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   const effectiveSidebarCollapsed = mounted ? sidebarCollapsed : false;
+
+  // ---------------------------------------------------------------------------
+  // Deep-link handler: ?doc={hash}&page={N} (from Excel HYPERLINK cells)
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const docParam = params.get("doc");
+    const pageParam = params.get("page");
+    if (!docParam) return;
+
+    const trySelect = async () => {
+      let docs = useDocStore.getState().documents;
+      if (docs.length === 0) {
+        docs = await listDocuments();
+        useDocStore.getState().setDocuments(docs);
+      }
+      const match = docs.find((d) => d.doc_hash === docParam);
+      if (match && match.status === "completed") {
+        useDocStore.getState().selectDocument(docParam);
+        useViewerStore.getState().resetForNewDoc();
+        if (pageParam) {
+          const page = parseInt(pageParam, 10);
+          if (page > 0) useViewerStore.getState().setCurrentPage(page);
+        }
+      }
+    };
+    trySelect();
+    window.history.replaceState({}, "", window.location.pathname);
+  }, []);
 
   const inspectOpen = openPanels.includes("inspect");
   const exploreOpen = openPanels.includes("explore");

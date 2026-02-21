@@ -43,3 +43,9 @@ class AgentState(TypedDict):
     final_answer: str
     citations: List[Citation]
     confidence: float
+
+    # --- Visualization Outputs ---
+    viz_spec: Optional[Dict[str, Any]]       # Vega-Lite JSON spec
+    viz_data: Optional[List[Dict[str, Any]]] # Data rows for the chart
+    viz_sql: Optional[str]                   # SQL query that produced the data
+    viz_title: Optional[str]                 # Chart title

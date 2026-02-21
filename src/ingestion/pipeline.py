@@ -37,6 +37,7 @@ from src.storage.db_driver import ledger_db, DocumentLedger
 from src.storage.vector_driver import VectorDriver
 from src.storage.analytics_driver import AnalyticsDriver
 from src.ingestion.chunker import flatten_document
+from src.audit.engine import AuditEngine
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class IngestionPipeline:
         self.native_parser = NativeParser()
         self.indexer = VectorDriver()
         self.analytics = AnalyticsDriver()
+        self.audit_engine = AuditEngine()
         
     @traceable(name="Run Ingestion Pipeline", run_type="chain")
     async def run(
@@ -136,6 +138,22 @@ class IngestionPipeline:
             _emit("indexing", "Writing metric facts to Postgres...")
             logger.info("Indexing metric facts to Postgres...")
             self.analytics.index_metrics(doc)
+
+            # 3b. Audit — run quality checks after metric_facts are indexed
+            _emit("auditing", "Running data quality checks...")
+            try:
+                findings = self.audit_engine.run_all(doc_hash)
+                n_findings = len(findings)
+                if n_findings > 0:
+                    errors = sum(1 for f in findings if f.get("severity") == "error")
+                    warnings = sum(1 for f in findings if f.get("severity") == "warning")
+                    _emit("audited", f"{n_findings} findings ({errors} errors, {warnings} warnings)")
+                    logger.info(f"Audit: {n_findings} findings for {file_path.name}")
+                else:
+                    _emit("audited", "No issues found")
+            except Exception as audit_err:
+                logger.warning(f"Audit failed (non-critical): {audit_err}")
+                _emit("audited", "Audit skipped due to error")
             
         except Exception as e:
             logger.error(f"💥 Pipeline crashed on {file_path.name}: {e}")

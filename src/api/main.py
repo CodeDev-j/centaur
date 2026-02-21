@@ -44,6 +44,10 @@ async def startup():
         set_analytics_driver as set_executor_analytics,
     )
 
+    from src.audit.engine import AuditEngine
+    from src.api.routes.audit import set_audit_engine
+    from src.api.routes.export import set_export_drivers
+
     logger.info("Initializing Centaur API...")
 
     # Build LangGraph workflow (initializes all drivers internally)
@@ -66,17 +70,27 @@ async def startup():
     if _analytics_driver:
         set_executor_analytics(_analytics_driver)
 
+    # Initialize audit engine
+    audit_engine = AuditEngine()
+    set_audit_engine(audit_engine)
+
+    # Wire export drivers (analytics for data, audit for summary sheet)
+    if _analytics_driver:
+        set_export_drivers(_analytics_driver, audit_engine)
+
     logger.info("Centaur API ready.")
 
 
 # Register routes
-from src.api.routes import chat, ingestion, documents, prompts, workflows  # noqa: E402
+from src.api.routes import chat, ingestion, documents, prompts, workflows, audit, export  # noqa: E402
 
 app.include_router(chat.router)
 app.include_router(ingestion.router)
 app.include_router(documents.router)
 app.include_router(prompts.router)
 app.include_router(workflows.router)
+app.include_router(audit.router)
+app.include_router(export.router)
 
 
 @app.get("/health")

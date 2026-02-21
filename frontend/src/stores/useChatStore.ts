@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { Citation } from "@/lib/api";
+import { Citation, VizPayload } from "@/lib/api";
 
 export interface ChatMessage {
   role: "user" | "assistant";
@@ -9,6 +9,8 @@ export interface ChatMessage {
   /** Set while streaming: shows progress steps before answer arrives */
   isStreaming?: boolean;
   streamSteps?: StreamStep[];
+  /** Visualization payload from the visualize node */
+  viz?: VizPayload;
 }
 
 export interface StreamStep {

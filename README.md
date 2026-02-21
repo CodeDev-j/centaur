@@ -397,6 +397,124 @@ An integrated prompt engineering and workflow orchestration environment, decoupl
 
 ---
 
+## Audit Engine
+
+A first-class data quality layer that runs deterministic, code-only checks against the structured `metric_facts` table after ingestion. Zero LLM calls — pure SQL validators that surface extraction errors, VLM hallucinations, and cross-page inconsistencies.
+
+### The 6 Validators
+
+| Check | What It Does | Severity |
+|-------|-------------|----------|
+| **StackedTotalCheck** | For stacked bar charts, sums non-total series per label and compares to the stated "Total" series. Flags if mismatch > 2%. | Error |
+| **CrossPageConsistencyCheck** | Same metric + same period appearing on multiple pages with different values. Uses `GROUP BY series_label, label HAVING COUNT(DISTINCT resolved_value) > 1`. | Warning |
+| **YoYReasonabilityCheck** | Computes YoY growth between consecutive periods. Flags if growth > 300% or decline > 80%. Uses `LAG()` window function. | Warning |
+| **CurrencyMagnitudeCheck** | Detects mixed currencies (USD + EUR) or mixed magnitudes (M + B) within a single series — usually a VLM extraction error. | Error |
+| **NarrativeMetricCheck** | Extracts dollar amounts from narrative text via regex, cross-references against `metric_facts` `resolved_value`. Flags if narrative claims "$45M" but structured data shows $42.5M. 5% tolerance. | Warning |
+| **PercentVerificationCheck** | For percentage series, verifies against base values when identifiable (e.g., Gross Margin = 45% with Revenue and COGS present). | Info |
+
+### Architecture
+
+```
+Ingestion Pipeline → metric_facts insertion → AuditEngine.run_all(doc_hash)
+  ├─ 6 validators (pure SQL, no LLM)
+  ├─ Results → audit_findings table (Postgres, Alembic-managed)
+  └─ API: GET /documents/{hash}/audit, POST /documents/{hash}/audit/run
+```
+
+### Frontend Integration
+
+- **Document list badge**: Red/amber/green severity dot next to each document
+- **Audit section in Inspect panel**: Filter chip alongside Visual/Narrative/Header; finding cards with severity badge, title, expandable detail, click-to-navigate
+
+Performance: <500ms per document (50-200 metric_facts rows → queries complete in <50ms each).
+
+---
+
+## Traceable Excel Export
+
+One-click export of all extracted metrics as a formatted `.xlsx` workbook where every value cell hyperlinks back to the source page in Centaur.
+
+### Workbook Structure
+
+| Sheet | Content |
+|-------|---------|
+| **Summary** | Document metadata, filename, page count, ingestion date, audit findings count |
+| **Metrics** | Pivot-ready fact table: Page, Chart Title, Series, Period, Value, Currency, Magnitude, Resolved Value, Measure, Accounting Basis, Periodicity, Source (hyperlink) |
+| **Series Index** | Unique series with metadata: label, archetype, periodicity, data point count |
+
+### Hyperlink Traceability
+
+Every value in the Metrics sheet contains an `=HYPERLINK()` formula:
+```
+=HYPERLINK("http://localhost:3000?doc={hash}&page={N}", "Page {N}")
+```
+
+Clicking a hyperlink opens Centaur, auto-selects the document, and navigates to the exact page. The base URL is configurable via `CENTAUR_BASE_URL` environment variable.
+
+### Formatting
+
+- Frozen header row with auto-filter (pivot-ready)
+- `resolved_value` in accounting number format (`#,##0.00`)
+- Periods sorted by `period_date` (temporal, not alphabetical)
+- Conditional red fill on cells with associated audit findings
+- Built with `openpyxl` for fine-grained control over formatting and hyperlinks
+
+### API
+
+```
+GET /api/v1/documents/{doc_hash}/export/excel → StreamingResponse (.xlsx)
+GET /api/v1/export/excel?doc_hashes=hash1,hash2 → Multi-doc workbook
+```
+
+---
+
+## Natural Language Data Visualization
+
+User types "Chart revenue by quarter" in chat → an interactive Vega-Lite chart renders inline in the chat stream, using structured data from the `metric_facts` SQL table.
+
+### Architecture
+
+```
+User: "Chart EBITDA margin for 2020-2024"
+  ↓
+LangGraph Router → route = "visualization"
+  ↓
+visualize node (terminal — skips generate_answer)
+  ├─ Step 1: Text-to-SQL → query metric_facts
+  ├─ Step 2: Execute SQL (existing safety guards)
+  ├─ Step 3: LLM generates Vega-Lite v5 spec from data + user intent
+  └─ Return: {spec, data, sql, title}
+  ↓
+SSE event: type="viz" → Frontend renders with vega-embed
+```
+
+### Why Vega-Lite
+
+- **LLM-friendly**: Single declarative JSON spec, well-documented, LLMs trained on many examples
+- **Safe**: No imperative code generation — just a data visualization grammar
+- **Feature-rich**: Temporal axes, faceting, aggregation, tooltips, dark theme support
+- **Lightweight**: `vega-embed` is ~200KB gzipped, renders to Canvas/SVG
+
+### Data Guards
+
+- **500-row limit**: If SQL returns >500 rows, auto-aggregate before sending to frontend
+- **Spec validation**: Vega-Lite JSON parsed server-side before SSE emission
+- **Fallback**: If spec generation fails, raw SQL results returned as a table
+- **Dark theme**: Background `#111111`, text `#ededed`, grid `#333` — matches Centaur's material design
+
+### Cross-Document Visualization
+
+Since `metric_facts` contains `doc_hash` and `source_file`, cross-document queries work automatically:
+```sql
+SELECT source_file, label, resolved_value
+FROM metric_facts WHERE series_label ILIKE '%revenue%'
+ORDER BY period_date
+```
+
+The router skips `doc_filter` when the query spans multiple documents.
+
+---
+
 ## Security
 
 ### Hardening (Applied)
@@ -459,6 +577,12 @@ centaur/
 │   │   ├── filters.py                     # Token firewall (noise stripping)
 │   │   └── phantom.py                     # Shadow PDF generation (Playwright)
 │   │
+│   ├── audit/                             # DATA QUALITY
+│   │   └── engine.py                      # 6 deterministic validators + AuditEngine orchestrator
+│   │
+│   ├── export/                            # EXPORT PIPELINE
+│   │   └── excel_builder.py               # openpyxl workbook builder with HYPERLINK traceability
+│   │
 │   ├── retrieval/                         # READ PATH
 │   │   ├── qdrant.py                      # Full pipeline (expand -> search -> rerank)
 │   │   ├── term_injector.py               # Multilingual query expansion + label matching
@@ -491,6 +615,7 @@ centaur/
 │   │       ├── retrieve.py                # Retrieval nodes (qualitative, quantitative, hybrid)
 │   │       ├── financial_math.py          # Text-to-SQL over metric_facts
 │   │       ├── generate.py                # Structured output generation + citation assembly
+│   │       ├── visualize.py               # NL → Text-to-SQL → Vega-Lite spec generation
 │   │       └── legal_reasoning.py         # Legal analysis node
 │   │
 │   ├── api/                               # FASTAPI SERVER
@@ -500,6 +625,8 @@ centaur/
 │   │       ├── chat.py                    # POST /chat, POST /chat/stream (SSE)
 │   │       ├── ingestion.py               # POST /ingest, GET /documents
 │   │       ├── documents.py               # PDF serving, page rendering, chunk inspection
+│   │       ├── audit.py                   # Audit findings CRUD + re-run trigger
+│   │       ├── export.py                  # Excel export (single-doc + multi-doc)
 │   │       ├── prompts.py                 # Prompt CRUD + publish + test run (9 endpoints)
 │   │       └── workflows.py               # Workflow CRUD + steps + run + approve (14 endpoints)
 │   │
@@ -527,6 +654,7 @@ centaur/
 │       │   ├── RightPanel.tsx             # Segmented tab control + resize handle
 │       │   ├── WelcomeDropzone.tsx        # Center empty state with drag-and-drop upload
 │       │   ├── BootSplash.tsx             # One-shot wordmark animation (sessionStorage-gated)
+│       │   ├── ChatVizBlock.tsx            # Vega-Lite chart renderer (vega-embed)
 │       │   ├── BboxOverlay.tsx            # Pixel-precise citation highlight
 │       │   ├── MiniSparkline.tsx          # Inline SVG sparkline for metric trends
 │       │   └── ErrorBoundary.tsx          # React class error boundary for crash recovery

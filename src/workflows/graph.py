@@ -2,7 +2,9 @@
 LangGraph Workflow: The Brain.
 
 Assembles the query processing pipeline:
-  START → route_query → {qualitative|quantitative|hybrid} → generate_answer → verify → END
+  START → route_query → {qualitative|quantitative|hybrid|visualize} → generate_answer → verify → END
+                                                          ↑
+                                               visualize is terminal (→ END directly)
 
 All nodes are async and traced via LangSmith.
 """
@@ -21,6 +23,7 @@ from src.workflows.nodes.retrieve import (
     set_analytics_driver,
 )
 from src.workflows.nodes.generate import generate_answer, verify_and_finalize
+from src.workflows.nodes.visualize import visualize, set_viz_analytics_driver
 
 from src.storage.vector_driver import VectorDriver
 from src.storage.analytics_driver import AnalyticsDriver
@@ -31,12 +34,14 @@ logger = logging.getLogger(__name__)
 
 
 def _route_decision(state: AgentState) -> str:
-    """Conditional edge: routes to the correct retrieval node."""
+    """Conditional edge: routes to the correct retrieval/viz node."""
     route = state.get("query_route", "hybrid")
     if route == "qualitative":
         return "retrieve_qualitative"
     elif route == "quantitative":
         return "retrieve_quantitative"
+    elif route == "visualization":
+        return "visualize"
     else:
         return "retrieve_hybrid"
 
@@ -59,6 +64,9 @@ def build_graph() -> StateGraph:
     set_retrieval_pipeline(retrieval_pipeline)
     set_analytics_driver(analytics_driver)
 
+    # Wire analytics driver into visualize node
+    set_viz_analytics_driver(analytics_driver)
+
     # Build graph
     graph = StateGraph(AgentState)
 
@@ -69,11 +77,12 @@ def build_graph() -> StateGraph:
     graph.add_node("retrieve_hybrid", retrieve_hybrid)
     graph.add_node("generate_answer", generate_answer)
     graph.add_node("verify_and_finalize", verify_and_finalize)
+    graph.add_node("visualize", visualize)
 
     # Set entry point
     graph.set_entry_point("route_query")
 
-    # Conditional routing
+    # Conditional routing (now includes visualization)
     graph.add_conditional_edges(
         "route_query",
         _route_decision,
@@ -81,6 +90,7 @@ def build_graph() -> StateGraph:
             "retrieve_qualitative": "retrieve_qualitative",
             "retrieve_quantitative": "retrieve_quantitative",
             "retrieve_hybrid": "retrieve_hybrid",
+            "visualize": "visualize",
         },
     )
 
@@ -88,6 +98,9 @@ def build_graph() -> StateGraph:
     graph.add_edge("retrieve_qualitative", "generate_answer")
     graph.add_edge("retrieve_quantitative", "generate_answer")
     graph.add_edge("retrieve_hybrid", "generate_answer")
+
+    # Visualize is terminal — the chart IS the answer
+    graph.add_edge("visualize", END)
 
     # Generation → verification → END
     graph.add_edge("generate_answer", "verify_and_finalize")
