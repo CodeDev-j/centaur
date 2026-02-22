@@ -66,11 +66,13 @@ class PromptVersion(Base):
     template = Column(Text, nullable=False)          # Jinja2 template with {{variables}}
     variables = Column(JSON, default=list)            # [{name, type, default, description}]
 
-    # Execution config
-    exec_mode = Column(String, default="rag")         # rag | structured | direct | sql
-    output_schema = Column(JSON, nullable=True)       # Pydantic schema def (for structured mode)
-    model_id = Column(String, nullable=True)          # Override model (null = system default)
-    retrieval_mode = Column(String, nullable=True)    # qualitative | quantitative (for rag/structured)
+    # Execution config — orthogonal axes
+    context_source = Column(String, default="documents")           # documents | metrics_db | none
+    output_format = Column(String, default="text")                 # text | json | chart | table
+    search_strategy = Column(JSON, default=lambda: ["semantic"])   # ["semantic"], ["numeric"], or both
+    output_schema = Column(JSON, nullable=True)                    # Pydantic schema def (for json output)
+    model_id = Column(String, nullable=True)                       # Override model (null = system default)
+    temperature = Column(Float, default=0.1)                       # LLM temperature (persisted per-version)
 
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow)

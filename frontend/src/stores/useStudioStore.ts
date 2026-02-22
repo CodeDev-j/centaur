@@ -4,6 +4,9 @@ import {
   PromptDetail,
   PromptRunResult,
   PromptVariable,
+  ContextSource,
+  OutputFormat,
+  SearchStrategy,
 } from "@/lib/api";
 
 // ─── Draft state (Zustand only — never persisted until Publish) ──────
@@ -11,10 +14,19 @@ import {
 export interface DraftState {
   template: string;
   variables: PromptVariable[];
-  exec_mode: string;
+  context_source: ContextSource;
+  output_format: OutputFormat;
+  search_strategy: SearchStrategy[];
   output_schema: Record<string, unknown> | null;
   model_id: string | null;
-  retrieval_mode: string | null;
+  temperature: number;
+}
+
+/** Validation: chart/table require metrics_db as context source */
+export function isValidCombination(source: ContextSource, format: OutputFormat): boolean {
+  if (format === "chart" && source !== "metrics_db") return false;
+  if (format === "table" && source !== "metrics_db") return false;
+  return true;
 }
 
 // ─── Store interface ─────────────────────────────────────────────────
@@ -38,7 +50,7 @@ interface StudioState {
   hasRetrievalCache: boolean;
 
   // ── UI ────────────────────────────────────────────
-  studioTab: "prompts" | "workflows";
+  studioTab: "prompts" | "workflows" | "tools";
   view: "library" | "editor";
 
   // ── Actions ───────────────────────────────────────
@@ -50,18 +62,22 @@ interface StudioState {
 
   // Draft editing
   setDraftTemplate: (template: string) => void;
-  setDraftExecMode: (mode: string) => void;
-  setDraftRetrievalMode: (mode: string | null) => void;
+  setDraftContextSource: (source: ContextSource) => void;
+  setDraftOutputFormat: (format: OutputFormat) => void;
+  toggleSearchStrategy: (strategy: SearchStrategy) => void;
+  setDraftTemperature: (temp: number) => void;
   setDraftModelId: (id: string | null) => void;
   setDraftOutputSchema: (schema: Record<string, unknown> | null) => void;
   setDraftVariables: (vars: PromptVariable[]) => void;
   loadDraftFromVersion: (version: {
     template: string;
     variables: PromptVariable[];
-    exec_mode: string;
+    context_source: ContextSource;
+    output_format: OutputFormat;
+    search_strategy: SearchStrategy[];
     output_schema: Record<string, unknown> | null;
     model_id: string | null;
-    retrieval_mode: string | null;
+    temperature: number;
   }) => void;
   markDraftClean: () => void;
 
@@ -73,7 +89,7 @@ interface StudioState {
   setHasRetrievalCache: (v: boolean) => void;
 
   // Navigation
-  setStudioTab: (tab: "prompts" | "workflows") => void;
+  setStudioTab: (tab: "prompts" | "workflows" | "tools") => void;
   setView: (view: "library" | "editor") => void;
   goBackToLibrary: () => void;
 }
@@ -83,10 +99,12 @@ interface StudioState {
 const DEFAULT_DRAFT: DraftState = {
   template: "",
   variables: [],
-  exec_mode: "rag",
+  context_source: "documents",
+  output_format: "text",
+  search_strategy: ["semantic"],
   output_schema: null,
   model_id: null,
-  retrieval_mode: "qualitative",
+  temperature: 0.1,
 };
 
 // ─── Store ───────────────────────────────────────────────────────────
@@ -116,6 +134,7 @@ export const useStudioStore = create<StudioState>((set) => ({
     set({
       selectedPromptId: id,
       selectedPrompt: null,
+      selectedPromptLoading: true,
       runResult: null,
       runVariables: {},
       draftDirty: false,
@@ -127,10 +146,28 @@ export const useStudioStore = create<StudioState>((set) => ({
   // Draft actions
   setDraftTemplate: (template) =>
     set((s) => ({ draft: { ...s.draft, template }, draftDirty: true })),
-  setDraftExecMode: (mode) =>
-    set((s) => ({ draft: { ...s.draft, exec_mode: mode }, draftDirty: true })),
-  setDraftRetrievalMode: (mode) =>
-    set((s) => ({ draft: { ...s.draft, retrieval_mode: mode }, draftDirty: true })),
+  setDraftContextSource: (source) =>
+    set((s) => {
+      const draft = { ...s.draft, context_source: source };
+      // Auto-fix invalid combos: if chart/table and source isn't metrics_db, reset to text
+      if (!isValidCombination(source, draft.output_format)) {
+        draft.output_format = "text";
+      }
+      return { draft, draftDirty: true };
+    }),
+  setDraftOutputFormat: (format) =>
+    set((s) => ({ draft: { ...s.draft, output_format: format }, draftDirty: true })),
+  toggleSearchStrategy: (strategy) =>
+    set((s) => {
+      const current = s.draft.search_strategy;
+      const has = current.includes(strategy);
+      // Don't allow empty — at least one must remain
+      if (has && current.length === 1) return {};
+      const next = has ? current.filter((s) => s !== strategy) : [...current, strategy];
+      return { draft: { ...s.draft, search_strategy: next }, draftDirty: true };
+    }),
+  setDraftTemperature: (temp) =>
+    set((s) => ({ draft: { ...s.draft, temperature: temp }, draftDirty: true })),
   setDraftModelId: (id) =>
     set((s) => ({ draft: { ...s.draft, model_id: id }, draftDirty: true })),
   setDraftOutputSchema: (schema) =>
@@ -142,10 +179,12 @@ export const useStudioStore = create<StudioState>((set) => ({
       draft: {
         template: version.template,
         variables: version.variables,
-        exec_mode: version.exec_mode,
+        context_source: version.context_source,
+        output_format: version.output_format,
+        search_strategy: version.search_strategy,
         output_schema: version.output_schema,
         model_id: version.model_id,
-        retrieval_mode: version.retrieval_mode,
+        temperature: version.temperature,
       },
       draftDirty: false,
       runResult: null,

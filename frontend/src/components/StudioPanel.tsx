@@ -12,9 +12,12 @@ import {
   RefreshCw,
   Zap,
 } from "lucide-react";
-import { useStudioStore } from "@/stores/useStudioStore";
+import { useStudioStore, isValidCombination } from "@/stores/useStudioStore";
 import { useDocStore } from "@/stores/useDocStore";
 import WorkflowBuilderPanel from "./WorkflowBuilder";
+import ToolsPanel from "./ToolsPanel";
+import SegmentedControl from "./SegmentedControl";
+import ChatVizBlock from "./ChatVizBlock";
 import {
   listPrompts,
   createPrompt,
@@ -23,6 +26,8 @@ import {
   publishVersion,
   runPrompt,
   PromptSummary,
+  ContextSource,
+  OutputFormat,
 } from "@/lib/api";
 
 // ─── Jinja2 variable extraction ──────────────────────────────────────
@@ -41,14 +46,25 @@ function extractVariables(template: string): string[] {
   return Array.from(vars);
 }
 
-// ─── Exec mode options ───────────────────────────────────────────────
+// ─── Axis options ───────────────────────────────────────────────────
 
-const EXEC_MODES = [
-  { value: "rag", label: "RAG", desc: "Retrieval + Generate" },
-  { value: "structured", label: "Structured", desc: "Retrieval + JSON Output" },
-  { value: "direct", label: "Direct", desc: "LLM Only" },
-  { value: "sql", label: "SQL", desc: "Text-to-SQL" },
-] as const;
+const CONTEXT_SOURCES = [
+  { value: "documents", label: "Documents" },
+  { value: "metrics_db", label: "Metrics DB" },
+  { value: "none", label: "None" },
+];
+
+const OUTPUT_FORMATS = [
+  { value: "text", label: "Text" },
+  { value: "json", label: "JSON" },
+  { value: "chart", label: "Chart" },
+  { value: "table", label: "Table" },
+];
+
+const SEARCH_STRATEGIES = [
+  { value: "semantic", label: "Semantic" },
+  { value: "numeric", label: "Numeric" },
+];
 
 // ─── Library View ────────────────────────────────────────────────────
 
@@ -95,7 +111,6 @@ function PromptLibrary() {
     const store = useStudioStore.getState();
     store.selectPrompt(id);
     store.setView("editor");
-    store.setSelectedPromptLoading(true);
     try {
       const detail = await getPrompt(id);
       useStudioStore.getState().setSelectedPrompt(detail);
@@ -107,14 +122,18 @@ function PromptLibrary() {
         useStudioStore.getState().loadDraftFromVersion({
           template: "",
           variables: [],
-          exec_mode: "rag",
+          context_source: "documents",
+          output_format: "text",
+          search_strategy: ["semantic"],
           output_schema: null,
           model_id: null,
-          retrieval_mode: "qualitative",
+          temperature: 0.1,
         });
       }
     } catch (err) {
       console.error("Failed to load prompt:", err);
+      // Return to library on error instead of showing "Prompt not found"
+      useStudioStore.getState().goBackToLibrary();
     } finally {
       useStudioStore.getState().setSelectedPromptLoading(false);
     }
@@ -252,6 +271,15 @@ function PromptEditor() {
   // Extract Jinja2 variables from template
   const detectedVars = extractVariables(draft.template);
 
+  // Build output format options with disabled states
+  const outputFormatOptions = OUTPUT_FORMATS.map((opt) => ({
+    ...opt,
+    disabled: !isValidCombination(draft.context_source, opt.value as OutputFormat),
+    tooltip: !isValidCombination(draft.context_source, opt.value as OutputFormat)
+      ? `${opt.label} requires Metrics DB as context source`
+      : undefined,
+  }));
+
   // Auto-resize textarea
   useEffect(() => {
     const ta = textareaRef.current;
@@ -286,10 +314,12 @@ function PromptEditor() {
       await publishVersion(selectedPrompt.id, {
         template: draft.template,
         variables: draft.variables,
-        exec_mode: draft.exec_mode,
+        context_source: draft.context_source,
+        output_format: draft.output_format,
+        search_strategy: draft.search_strategy,
         output_schema: draft.output_schema,
         model_id: draft.model_id,
-        retrieval_mode: draft.retrieval_mode,
+        temperature: draft.temperature,
       });
       // Refresh prompt to get new version
       const detail = await getPrompt(selectedPrompt.id);
@@ -313,17 +343,18 @@ function PromptEditor() {
       const result = await runPrompt(selectedPrompt.id, {
         template: draft.template,
         variables: runVariables,
-        exec_mode: draft.exec_mode,
+        context_source: draft.context_source,
+        output_format: draft.output_format,
+        search_strategy: draft.search_strategy,
         output_schema: draft.output_schema ?? undefined,
-        retrieval_mode: draft.retrieval_mode ?? "qualitative",
         doc_filter: selectedDocHash ?? undefined,
         model_id: draft.model_id,
+        temperature: draft.temperature,
         force_retrieve: forceRetrieve,
       });
       useStudioStore.getState().setRunResult(result);
       // Track cache state for refinement loop
-      const isRetrievalMode = draft.exec_mode === "rag" || draft.exec_mode === "structured";
-      if (isRetrievalMode && !result.metadata.error) {
+      if (draft.context_source === "documents" && !result.metadata.error) {
         useStudioStore.getState().setHasRetrievalCache(true);
       }
     } catch (err) {
@@ -353,6 +384,9 @@ function PromptEditor() {
       </div>
     );
   }
+
+  // Check if run result contains a chart spec
+  const hasVizSpec = runResult?.structured?.spec != null;
 
   return (
     <div className="flex flex-col h-full">
@@ -400,42 +434,16 @@ function PromptEditor() {
 
       {/* Scrollable body */}
       <div className="flex-1 overflow-y-auto">
-        {/* Exec mode selector */}
+        {/* Context Source selector */}
         <div className="px-3 py-2 border-b border-[var(--border-subtle)]">
-          <div className="flex items-center gap-1.5">
-            {EXEC_MODES.map((mode) => (
-              <button
-                key={mode.value}
-                onClick={() => useStudioStore.getState().setDraftExecMode(mode.value)}
-                className={`px-2 py-1 rounded text-[10px] border transition-colors duration-75
-                  ${draft.exec_mode === mode.value
-                    ? "bg-[var(--bg-surface)] border-[var(--border-sharp)] text-[var(--text-primary)]"
-                    : "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface)]"
-                  }`}
-                title={mode.desc}
-              >
-                {mode.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Retrieval mode (only for rag/structured) */}
-          {(draft.exec_mode === "rag" || draft.exec_mode === "structured") && (
-            <div className="flex items-center gap-2 mt-2">
-              <span className="text-[10px] text-[var(--text-secondary)]">Retrieval:</span>
-              <select
-                value={draft.retrieval_mode ?? "qualitative"}
-                onChange={(e) =>
-                  useStudioStore.getState().setDraftRetrievalMode(e.target.value)
-                }
-                className="text-[10px] bg-[var(--bg-tertiary)] border border-[var(--border)]
-                  rounded px-1.5 py-0.5 text-[var(--text-secondary)]"
-              >
-                <option value="qualitative">Qualitative</option>
-                <option value="quantitative">Quantitative</option>
-              </select>
-            </div>
-          )}
+          <label className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider mb-1.5 block">
+            Context Source
+          </label>
+          <SegmentedControl
+            options={CONTEXT_SOURCES}
+            value={draft.context_source}
+            onChange={(v) => useStudioStore.getState().setDraftContextSource(v as ContextSource)}
+          />
         </div>
 
         {/* Template editor */}
@@ -503,6 +511,107 @@ function PromptEditor() {
             </div>
           </div>
         )}
+
+        {/* Output Format selector */}
+        <div className="px-3 py-2 border-t border-[var(--border-subtle)]">
+          <label className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider mb-1.5 block">
+            Output Format
+          </label>
+          <SegmentedControl
+            options={outputFormatOptions}
+            value={draft.output_format}
+            onChange={(v) => useStudioStore.getState().setDraftOutputFormat(v as OutputFormat)}
+          />
+        </div>
+
+        {/* JSON Schema editor (conditional) */}
+        {draft.output_format === "json" && (
+          <div className="px-3 py-2 border-t border-[var(--border-subtle)]">
+            <label className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider mb-1.5 block">
+              JSON Output Schema
+            </label>
+            <textarea
+              value={draft.output_schema ? JSON.stringify(draft.output_schema, null, 2) : ""}
+              onChange={(e) => {
+                try {
+                  const parsed = JSON.parse(e.target.value);
+                  useStudioStore.getState().setDraftOutputSchema(parsed);
+                } catch {
+                  // Allow typing — only update store when valid JSON
+                }
+              }}
+              placeholder='{"key": "string", "values": ["number"]}'
+              spellCheck={false}
+              className="w-full min-h-[80px] bg-[var(--bg-desk)] border border-[var(--border)]
+                rounded-md px-3 py-2 text-[11px] text-[var(--text-primary)] font-mono
+                resize-none outline-none
+                focus:border-[var(--accent)] transition-colors duration-100
+                placeholder:text-[var(--text-secondary)] placeholder:opacity-40"
+            />
+          </div>
+        )}
+
+        {/* Advanced Parameters (collapsible) */}
+        <details className="border-t border-[var(--border-subtle)]">
+          <summary className="px-3 py-2 text-[10px] text-[var(--text-secondary)] uppercase tracking-wider cursor-pointer hover:text-[var(--text-primary)] select-none">
+            Advanced Parameters
+          </summary>
+          <div className="px-3 pb-3 space-y-3">
+            {/* Model override */}
+            <div>
+              <label className="text-[10px] text-[var(--text-secondary)] mb-1 block">
+                Model Override
+              </label>
+              <input
+                type="text"
+                value={draft.model_id ?? ""}
+                onChange={(e) =>
+                  useStudioStore.getState().setDraftModelId(e.target.value || null)
+                }
+                placeholder="Default (from config)"
+                className="w-full text-[11px] bg-[var(--bg-desk)] border border-[var(--border)]
+                  rounded px-2 py-1 text-[var(--text-primary)] outline-none
+                  focus:border-[var(--accent)] transition-colors duration-100
+                  placeholder:text-[var(--text-secondary)] placeholder:opacity-40"
+              />
+            </div>
+
+            {/* Temperature */}
+            <div>
+              <label className="text-[10px] text-[var(--text-secondary)] mb-1 block">
+                Temperature: {draft.temperature.toFixed(1)}
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="2"
+                step="0.1"
+                value={draft.temperature}
+                onChange={(e) =>
+                  useStudioStore.getState().setDraftTemperature(parseFloat(e.target.value))
+                }
+                className="w-full h-1 accent-[var(--accent)]"
+              />
+            </div>
+
+            {/* Search Strategy (only when source=documents) */}
+            {draft.context_source === "documents" && (
+              <div>
+                <label className="text-[10px] text-[var(--text-secondary)] mb-1.5 block">
+                  Search Strategy
+                </label>
+                <SegmentedControl
+                  options={SEARCH_STRATEGIES}
+                  value={draft.search_strategy}
+                  onChange={(v) =>
+                    useStudioStore.getState().toggleSearchStrategy(v as "semantic" | "numeric")
+                  }
+                  multi
+                />
+              </div>
+            )}
+          </div>
+        </details>
 
         {/* Action bar */}
         <div className="px-3 py-2 border-t border-[var(--border-subtle)] flex items-center gap-2 flex-wrap">
@@ -589,14 +698,29 @@ function PromptEditor() {
                 Executing...
               </div>
             ) : runResult ? (
-              <div className="bg-[var(--bg-desk)] border border-[var(--border)] rounded-md p-3">
-                <pre className="text-[11px] text-[var(--text-primary)] font-mono whitespace-pre-wrap leading-relaxed max-h-[300px] overflow-y-auto">
-                  {runResult.structured
-                    ? JSON.stringify(runResult.structured, null, 2)
-                    : runResult.text
-                  }
-                </pre>
-              </div>
+              <>
+                {/* Chart rendering for viz specs */}
+                {hasVizSpec && (
+                  <ChatVizBlock
+                    spec={runResult.structured!.spec as Record<string, unknown>}
+                    data={(runResult.structured!.data ?? runResult.structured!.rows ?? []) as Record<string, unknown>[]}
+                    sql={(runResult.structured!.sql as string) ?? ""}
+                    title={(runResult.structured!.title as string) ?? ""}
+                  />
+                )}
+
+                {/* Text/JSON output */}
+                {!hasVizSpec && (
+                  <div className="bg-[var(--bg-desk)] border border-[var(--border)] rounded-md p-3">
+                    <pre className="text-[11px] text-[var(--text-primary)] font-mono whitespace-pre-wrap leading-relaxed max-h-[300px] overflow-y-auto">
+                      {runResult.structured
+                        ? JSON.stringify(runResult.structured, null, 2)
+                        : runResult.text
+                      }
+                    </pre>
+                  </div>
+                )}
+              </>
             ) : null}
           </div>
         )}
@@ -619,7 +743,7 @@ function PromptEditor() {
                     v{v.version}
                   </span>
                   <span className="text-[10px] text-[var(--text-secondary)]">
-                    {v.exec_mode}
+                    {v.context_source} / {v.output_format}
                   </span>
                   <span className="text-[10px] text-[var(--text-secondary)] ml-auto opacity-60">
                     {v.created_at
@@ -642,6 +766,7 @@ function PromptEditor() {
 const STUDIO_TABS = [
   { id: "prompts" as const, label: "PROMPTS" },
   { id: "workflows" as const, label: "WORKFLOWS" },
+  { id: "tools" as const, label: "TOOLS" },
 ];
 
 function StudioTabBar() {
@@ -685,8 +810,10 @@ export default function StudioPanel() {
       <div className="flex-1 min-h-0">
         {studioTab === "prompts" ? (
           view === "library" ? <PromptLibrary /> : <PromptEditor />
-        ) : (
+        ) : studioTab === "workflows" ? (
           <WorkflowBuilderPanel />
+        ) : (
+          <ToolsPanel />
         )}
       </div>
     </div>

@@ -11,8 +11,8 @@ import { useViewerStore } from "@/stores/useViewerStore";
 import BboxOverlay from "./BboxOverlay";
 import WelcomeDropzone from "./WelcomeDropzone";
 
-// Configure PDF.js worker
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+// Configure PDF.js worker — local copy avoids CDN latency and CORS issues
+pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
 interface DocumentViewerProps {
   highlightBboxes?: { x: number; y: number; width: number; height: number }[] | null;
@@ -170,6 +170,7 @@ export default function DocumentViewer({
       >
         <div className="pdf-page-container" ref={pageWrapperRef}>
           <Document
+            key={docHash}
             file={pdfUrl}
             onLoadSuccess={onDocumentLoadSuccess}
             loading={

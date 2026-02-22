@@ -183,7 +183,13 @@ class AnalyticsDriver:
             f"@{SystemConfig.POSTGRES_HOST}:{SystemConfig.POSTGRES_PORT}"
             f"/{SystemConfig.POSTGRES_DB}"
         )
-        self.engine = create_engine(db_url, pool_pre_ping=True)
+        self.engine = create_engine(
+            db_url,
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=20,
+            pool_recycle=3600,
+        )
         Base.metadata.create_all(bind=self.engine)
         self.SessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=self.engine

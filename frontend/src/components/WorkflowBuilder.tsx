@@ -133,10 +133,12 @@ function WorkflowList({
         ) : (
           <div className="py-1">
             {workflows.map((w) => (
-              <button
+              <div
                 key={w.id}
+                role="button"
+                tabIndex={0}
                 onClick={() => onSelect(w.id)}
-                className="w-full flex items-start gap-2.5 px-3 py-2 text-left
+                className="w-full flex items-start gap-2.5 px-3 py-2 text-left cursor-pointer
                   hover:bg-[var(--bg-surface)] transition-colors duration-75 group"
               >
                 <GitBranch size={14} className="text-[var(--text-secondary)] mt-0.5 shrink-0" />
@@ -153,7 +155,7 @@ function WorkflowList({
                 >
                   <Trash2 size={12} className="text-[var(--text-secondary)]" />
                 </button>
-              </button>
+              </div>
             ))}
           </div>
         )}
@@ -264,7 +266,7 @@ function StepPicker({
                           v{v.version}
                         </span>
                         <span className="text-[10px] text-[var(--text-secondary)]">
-                          {v.exec_mode}
+                          {v.context_source} / {v.output_format}
                         </span>
                       </button>
                     ))
@@ -427,7 +429,7 @@ function WorkflowEditor({
                       {step.label}
                     </div>
                     <div className="text-[10px] text-[var(--text-secondary)] opacity-60">
-                      {step.prompt_version?.exec_mode ?? "?"} → {step.output_key}
+                      {step.prompt_version ? `${step.prompt_version.context_source} / ${step.prompt_version.output_format}` : "?"} → {step.output_key}
                     </div>
                   </div>
                   <button

@@ -44,8 +44,11 @@ async def _execute_single_step(
     """
     pv = step.get("prompt_version") or {}
     template = pv.get("template", "")
-    exec_mode = pv.get("exec_mode", "rag")
+    context_source = pv.get("context_source", "documents")
+    output_format = pv.get("output_format", "text")
+    search_strategy = pv.get("search_strategy", ["semantic"])
     model_id = pv.get("model_id")
+    temperature = pv.get("temperature", 0.1)
 
     # Build variable context for Jinja2 resolution
     # Steps access prior outputs via: {{ steps.step_key.text }}
@@ -70,9 +73,12 @@ async def _execute_single_step(
     result: StepOutput = await execute_prompt(
         template=template,
         variables=all_vars,
-        exec_mode=exec_mode,
+        context_source=context_source,
+        output_format=output_format,
+        search_strategy=search_strategy,
         doc_filter=doc_filter,
         model_id=model_id,
+        temperature=temperature,
     )
 
     return {

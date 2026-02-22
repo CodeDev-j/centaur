@@ -63,6 +63,36 @@ These rules are **invariants**. Do not remove, override, or regress them when ad
 - **Frontend**: `vega-embed` renders Vega-Lite specs in chat; fallback to raw table if spec fails
 - **Router extension**: `route_query` detects "visualization" intent (chart, plot, graph, visualize, trend, compare...visually)
 
+## Prompt Studio Invariants
+
+- **MECE execution axes**: Context Source (documents|metrics_db|none) × Output Format (text|json|chart|table) — two independent dimensions, not 4 conflated modes
+- **Valid combos**: 8 of 12; chart/table disabled when source ≠ metrics_db
+- **Search strategy**: Multi-select [SEMANTIC|NUMERIC]; both = hybrid retrieval (merge + deduplicate by chunk_id)
+- **TABLE bypasses LLM entirely** — returns raw SQL rows in ~50ms (no token cost)
+- **2-step executor pipeline**: `_fetch_context()` → `_generate_output()` via ContextResult dataclass
+- **Cache key includes search strategy**: `{prompt_id}:{doc_filter}:{sorted_strategies}` — prevents poisoning when toggling SEMANTIC↔NUMERIC
+- **Context window guard**: SQL results limited to 50 rows for LLM markdown injection; full data preserved in ContextResult.sql_rows for chart/table
+- **ContextResult carries raw_chunks**: Citation metadata preserved for audit trail (source_file, page_number)
+- **Temperature persisted per-version**: Frozen into published snapshots for workflow determinism
+- **Legacy API translator**: `@model_validator(mode="before")` converts old exec_mode payloads during transition period
+- **Tools tab**: PROMPTS | WORKFLOWS | TOOLS — AgentTools expose prompts/workflows as reusable tools (MCP Phase 2)
+- **Naming**: DOCUMENTS (not RAG), METRICS DB (not SQL), NONE (not Direct), JSON (not Structured), SEMANTIC/NUMERIC (not qualitative/quantitative)
+
+## Document Manager Invariants
+
+- **Separate `document_meta` table** — decoupled from `document_ledger` (ingestion state vs semantic metadata)
+- **3-tier metadata extraction**: Deterministic (page_count, currency) → VLM-assisted (company_name, document_type, sector) at ~$0.01/doc
+- **"Goldman Sachs trap" guard**: VLM prompt explicitly instructs company_name = subject entity, NOT the advisor/bank
+- **`user_overrides` JSON field**: Tracks which fields were manually edited; VLM re-extraction skips overridden fields
+- **`project_code`**: Virtual folder for deal teams — replaces traditional folder hierarchy
+- **`as_of_date` vs `publish_date`**: Separate temporal fields (period end date vs document publish date)
+- **Client-side fuzzy search**: `fuse.js` with weighted multi-field matching, 150ms debounce
+- **Virtualized scrolling**: `@tanstack/react-virtual` for 60fps with 1000+ documents
+- **2-line compressed cards**: company_name + type/period only (256px sidebar width is unforgiving)
+- **Right Panel metadata inspector**: Form-based panel with AUTO/EDITED badges per field, not inline card expansion
+- **Checkbox-on-hover** multi-select with Ctrl+Click, Shift+Click range select, floating batch action bar
+- **Metadata panel**: PanelId = "meta" added to right panel system, requires selected document
+
 ## Design Philosophy
 
 - No risk classification at ingestion — neutral fact record only

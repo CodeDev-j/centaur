@@ -48,29 +48,6 @@ CRITICAL RULES:
 Output ONLY the SQL query, no explanations or markdown."""
 
 
-_VIZ_SPEC_PROMPT = """Given this SQL result data and the user's visualization request, generate a Vega-Lite v5 specification.
-
-User request: {query}
-SQL executed: {sql}
-Data (first 10 rows): {sample_data}
-Total rows: {row_count}
-Column names and types: {column_info}
-
-Rules:
-- Use "$schema": "https://vega.github.io/schema/vega-lite/v5.json"
-- Data will be injected separately via "data.values" — do NOT include a "data" field
-- Choose appropriate mark type: bar (comparisons), line (trends), point (scatter), area (cumulative)
-- Use proper temporal axis formatting if period_date is present
-- Format resolved_value as numbers (not scientific notation)
-- Include a descriptive title derived from the user's request
-- Dark theme colors: background "#111111", text "#ededed", gridColor "#333333"
-- Configure axis labels, tooltips, and legend as appropriate
-- Width: 480, Height: 300 (container will resize)
-- If multiple series, use color encoding on series_label or source_file
-
-Return ONLY the Vega-Lite JSON spec, no explanation or markdown fences."""
-
-
 MAX_VIZ_ROWS = 500
 
 
@@ -173,48 +150,13 @@ async def visualize(state: AgentState) -> dict:
         logger.warning(f"Viz data too large ({len(data)} rows), truncating to {MAX_VIZ_ROWS}")
         data = data[:MAX_VIZ_ROWS]
 
-    # Step 3: Generate Vega-Lite spec
-    sample = data[:10]
-    column_info = {}
-    if data:
-        for key, val in data[0].items():
-            column_info[key] = type(val).__name__
-
-    spec_prompt = _VIZ_SPEC_PROMPT.format(
-        query=query,
-        sql=sql,
-        sample_data=json.dumps(sample, default=str, indent=2),
-        row_count=len(data),
-        column_info=json.dumps(column_info),
-    )
-
-    spec_llm = SystemConfig.get_llm(
-        model_name=SystemConfig.GENERATION_MODEL,
-        temperature=0.0,
-        max_tokens=2000,
-    )
+    # Step 3: Generate Vega-Lite spec via shared helper
+    from src.workflows.viz_helper import generate_vega_spec, clean_data_for_json
 
     try:
-        spec_response = await spec_llm.ainvoke([
-            {"role": "system", "content": spec_prompt},
-            {"role": "user", "content": "Generate the Vega-Lite specification."},
-        ])
-        spec_text = spec_response.content.strip()
-
-        # Strip markdown fences
-        if spec_text.startswith("```"):
-            lines = spec_text.split('\n')
-            spec_text = '\n'.join(
-                lines[1:-1] if lines[-1].strip() == '```' else lines[1:]
-            )
-            spec_text = spec_text.strip()
-
-        spec = json.loads(spec_text)
-        logger.info("Vega-Lite spec generated successfully")
-
+        spec = await generate_vega_spec(query, data, sql)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse Vega-Lite spec: {e}")
-        # Fallback: return data as table
         return {
             "final_answer": "Generated data but could not create chart. Here are the raw results.",
             "viz_spec": None,
@@ -230,19 +172,8 @@ async def visualize(state: AgentState) -> dict:
             "viz_sql": sql,
         }
 
-    # Build a title from the spec or query
     viz_title = spec.get("title", query[:60])
-
-    # Serialize data values for JSON transport (handle dates etc.)
-    clean_data = []
-    for row in data:
-        clean_row = {}
-        for k, v in row.items():
-            if hasattr(v, 'isoformat'):
-                clean_row[k] = v.isoformat()
-            else:
-                clean_row[k] = v
-        clean_data.append(clean_row)
+    clean_data = clean_data_for_json(data)
 
     return {
         "final_answer": "",

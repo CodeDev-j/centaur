@@ -9,6 +9,8 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.13.18",
+    "fuse.js": "^7.1.0",
     "geist": "^1.7.0",
     "lucide-react": "^0.468.0",
     "next": "^16.1.6",

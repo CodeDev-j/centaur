@@ -130,10 +130,12 @@ class StudioDriver:
                         "version": v.version,
                         "template": v.template,
                         "variables": v.variables,
-                        "exec_mode": v.exec_mode,
+                        "context_source": v.context_source,
+                        "output_format": v.output_format,
+                        "search_strategy": v.search_strategy,
                         "output_schema": v.output_schema,
                         "model_id": v.model_id,
-                        "retrieval_mode": v.retrieval_mode,
+                        "temperature": v.temperature,
                         "created_at": v.created_at.isoformat() if v.created_at else None,
                         "is_published": v.is_published,
                     }
@@ -183,10 +185,12 @@ class StudioDriver:
         prompt_id: str,
         template: str,
         variables: Optional[List[dict]] = None,
-        exec_mode: str = "rag",
+        context_source: str = "documents",
+        output_format: str = "text",
+        search_strategy: Optional[List[str]] = None,
         output_schema: Optional[dict] = None,
         model_id: Optional[str] = None,
-        retrieval_mode: Optional[str] = None,
+        temperature: float = 0.1,
     ) -> Optional[dict]:
         """
         Create an immutable prompt version. Auto-increments version number.
@@ -211,10 +215,12 @@ class StudioDriver:
                 version=next_version,
                 template=template,
                 variables=variables or [],
-                exec_mode=exec_mode,
+                context_source=context_source,
+                output_format=output_format,
+                search_strategy=search_strategy or ["semantic"],
                 output_schema=output_schema,
                 model_id=model_id,
-                retrieval_mode=retrieval_mode,
+                temperature=temperature,
                 is_published=True,
             )
             s.add(pv)
@@ -226,10 +232,12 @@ class StudioDriver:
                 "version": next_version,
                 "template": template,
                 "variables": pv.variables,
-                "exec_mode": exec_mode,
+                "context_source": context_source,
+                "output_format": output_format,
+                "search_strategy": pv.search_strategy,
                 "output_schema": output_schema,
                 "model_id": model_id,
-                "retrieval_mode": retrieval_mode,
+                "temperature": temperature,
                 "is_published": True,
             }
 
@@ -245,10 +253,12 @@ class StudioDriver:
                 "version": pv.version,
                 "template": pv.template,
                 "variables": pv.variables,
-                "exec_mode": pv.exec_mode,
+                "context_source": pv.context_source,
+                "output_format": pv.output_format,
+                "search_strategy": pv.search_strategy,
                 "output_schema": pv.output_schema,
                 "model_id": pv.model_id,
-                "retrieval_mode": pv.retrieval_mode,
+                "temperature": pv.temperature,
                 "created_at": pv.created_at.isoformat() if pv.created_at else None,
                 "is_published": pv.is_published,
             }
@@ -266,7 +276,10 @@ class StudioDriver:
                 {
                     "id": v.id,
                     "version": v.version,
-                    "exec_mode": v.exec_mode,
+                    "context_source": v.context_source,
+                    "output_format": v.output_format,
+                    "search_strategy": v.search_strategy,
+                    "temperature": v.temperature,
                     "created_at": v.created_at.isoformat() if v.created_at else None,
                     "is_published": v.is_published,
                 }
@@ -348,8 +361,11 @@ class StudioDriver:
                             "prompt_id": st.prompt_version.prompt_id,
                             "version": st.prompt_version.version,
                             "template": st.prompt_version.template,
-                            "exec_mode": st.prompt_version.exec_mode,
+                            "context_source": st.prompt_version.context_source,
+                            "output_format": st.prompt_version.output_format,
+                            "search_strategy": st.prompt_version.search_strategy,
                             "model_id": st.prompt_version.model_id,
+                            "temperature": st.prompt_version.temperature,
                         } if st.prompt_version else None,
                     }
                     for st in w.steps
@@ -605,6 +621,104 @@ class StudioDriver:
                 }
                 for r in runs
             ]
+
+
+    # ══════════════════════════════════════════════════════════════
+    # AGENT TOOLS
+    # ══════════════════════════════════════════════════════════════
+
+    @traceable(name="List Agent Tools", run_type="tool")
+    def list_tools(self, include_unpublished: bool = False) -> List[dict]:
+        with self.session() as s:
+            q = s.query(AgentTool)
+            if not include_unpublished:
+                q = q.filter(AgentTool.is_published == True)
+            q = q.order_by(AgentTool.created_at.desc())
+            return [
+                {
+                    "id": t.id,
+                    "name": t.name,
+                    "description": t.description,
+                    "icon": t.icon,
+                    "workflow_id": t.workflow_id,
+                    "prompt_version_id": t.prompt_version_id,
+                    "input_schema": t.input_schema,
+                    "output_format": t.output_format,
+                    "is_published": t.is_published,
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                }
+                for t in q.all()
+            ]
+
+    @traceable(name="Create Agent Tool", run_type="tool")
+    def create_tool(
+        self,
+        name: str,
+        description: str = "",
+        icon: str = "wrench",
+        workflow_id: Optional[str] = None,
+        prompt_version_id: Optional[str] = None,
+        input_schema: Optional[List[dict]] = None,
+        output_format: str = "text",
+    ) -> dict:
+        with self.session() as s:
+            tool = AgentTool(
+                id=str(uuid4()),
+                name=name,
+                description=description,
+                icon=icon,
+                workflow_id=workflow_id,
+                prompt_version_id=prompt_version_id,
+                input_schema=input_schema or [],
+                output_format=output_format,
+                is_published=False,
+            )
+            s.add(tool)
+            s.flush()
+            return {
+                "id": tool.id,
+                "name": name,
+                "description": description,
+                "icon": icon,
+                "workflow_id": workflow_id,
+                "prompt_version_id": prompt_version_id,
+                "input_schema": tool.input_schema,
+                "output_format": output_format,
+                "is_published": False,
+                "created_at": tool.created_at.isoformat() if tool.created_at else None,
+            }
+
+    @traceable(name="Update Agent Tool", run_type="tool")
+    def update_tool(
+        self,
+        tool_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        icon: Optional[str] = None,
+        is_published: Optional[bool] = None,
+    ) -> bool:
+        with self.session() as s:
+            t = s.query(AgentTool).filter(AgentTool.id == tool_id).first()
+            if not t:
+                return False
+            if name is not None:
+                t.name = name
+            if description is not None:
+                t.description = description
+            if icon is not None:
+                t.icon = icon
+            if is_published is not None:
+                t.is_published = is_published
+            return True
+
+    @traceable(name="Archive Agent Tool", run_type="tool")
+    def archive_tool(self, tool_id: str) -> bool:
+        with self.session() as s:
+            t = s.query(AgentTool).filter(AgentTool.id == tool_id).first()
+            if not t:
+                return False
+            t.is_published = False
+            return True
 
 
 # Singleton — lazily initialized (DB might not be up at import time)

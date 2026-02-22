@@ -3,10 +3,10 @@ import { ChunkDetail, DocStats } from "@/lib/api";
 
 // ─── Panel types ─────────────────────────────────────────────────────
 
-export type PanelId = "chat" | "inspect" | "explore" | "studio";
+export type PanelId = "chat" | "inspect" | "explore" | "studio" | "meta";
 
 /** Canonical left-to-right display order */
-export const PANEL_ORDER: PanelId[] = ["chat", "inspect", "explore", "studio"];
+export const PANEL_ORDER: PanelId[] = ["chat", "inspect", "explore", "studio", "meta"];
 
 const DEFAULT_PANEL_WIDTH = 380;
 const MIN_PANEL_WIDTH = 240;
@@ -102,6 +102,7 @@ export const useInspectStore = create<InspectState>((set) => ({
     inspect: DEFAULT_PANEL_WIDTH,
     explore: DEFAULT_PANEL_WIDTH,
     studio: 520,
+    meta: DEFAULT_PANEL_WIDTH,
   },
 
   togglePanel: (id) =>

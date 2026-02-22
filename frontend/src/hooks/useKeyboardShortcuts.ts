@@ -12,7 +12,7 @@ import { useChatStore } from "@/stores/useChatStore";
  * Escape           — deselect citation/chunk, blur input
  * / or Ctrl+K      — focus chat input
  * Ctrl+B / Cmd+B   — toggle sidebar
- * 1 / 2 / 3 / 4    — toggle panel (chat, inspect, explore, studio)
+ * 1 / 2 / 3 / 4 / 5 — toggle panel (chat, inspect, explore, studio, meta)
  * Ctrl+Shift+C     — copy current page chunks as TSV
  * j / k             — move up/down in Explorer rows
  * Enter             — navigate PDF to active Explorer row's page
@@ -83,6 +83,10 @@ export function useKeyboardShortcuts() {
         }
         case e.key === "4" && !ctrl: {
           useInspectStore.getState().togglePanel("studio");
+          break;
+        }
+        case e.key === "5" && !ctrl: {
+          useInspectStore.getState().togglePanel("meta");
           break;
         }
 

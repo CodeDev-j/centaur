@@ -37,6 +37,7 @@ from src.storage.db_driver import ledger_db, DocumentLedger
 from src.storage.vector_driver import VectorDriver
 from src.storage.analytics_driver import AnalyticsDriver
 from src.ingestion.chunker import flatten_document
+from src.ingestion.meta_extractor import extract_document_metadata
 from src.audit.engine import AuditEngine
 
 logger = logging.getLogger(__name__)
@@ -154,7 +155,21 @@ class IngestionPipeline:
             except Exception as audit_err:
                 logger.warning(f"Audit failed (non-critical): {audit_err}")
                 _emit("audited", "Audit skipped due to error")
-            
+
+            # 3c. Document Metadata Extraction
+            _emit("classifying", "Extracting document metadata...")
+            try:
+                import fitz
+                _page_count = len(fitz.open(str(file_path)))
+                meta_fields = await extract_document_metadata(doc, file_path, _page_count)
+                if ledger_db:
+                    ledger_db.upsert_document_meta(doc_hash, **meta_fields)
+                _emit("classified", f"{meta_fields.get('document_type', 'other')} — "
+                      f"{meta_fields.get('company_name', 'Unknown')}")
+            except Exception as meta_err:
+                logger.warning(f"Metadata extraction failed (non-critical): {meta_err}")
+                _emit("classified", "Metadata extraction skipped")
+
         except Exception as e:
             logger.error(f"💥 Pipeline crashed on {file_path.name}: {e}")
             logger.debug(traceback.format_exc())

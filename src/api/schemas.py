@@ -33,12 +33,23 @@ class ChatResponse(BaseModel):
 
 
 class DocumentSummary(BaseModel):
-    """Summary of an ingested document."""
+    """Summary of an ingested document, including metadata."""
     doc_hash: str
     filename: str
     status: str
     upload_date: Optional[str] = None
     total_items: int = 0
+    # Metadata fields (from document_meta table)
+    company_name: Optional[str] = None
+    document_type: Optional[str] = None
+    project_code: Optional[str] = None
+    as_of_date: Optional[str] = None
+    period_label: Optional[str] = None
+    sector: Optional[str] = None
+    currency: Optional[str] = None
+    page_count: int = 0
+    tags: List[str] = Field(default_factory=list)
+    extraction_confidence: float = 0.0
 
 
 class RegionOverlay(BaseModel):
@@ -90,3 +101,58 @@ class DocStatsResponse(BaseModel):
     doc_hash: str
     total_chunks: int
     by_type: Dict[str, int]
+
+
+# ==============================================================================
+# Document Metadata Schemas
+# ==============================================================================
+
+class DocumentMetaResponse(BaseModel):
+    """Full metadata for a single document."""
+    doc_hash: str
+    company_name: Optional[str] = None
+    document_type: Optional[str] = None
+    project_code: Optional[str] = None
+    as_of_date: Optional[str] = None
+    period_label: Optional[str] = None
+    publish_date: Optional[str] = None
+    sector: Optional[str] = None
+    geography: Optional[str] = None
+    currency: Optional[str] = None
+    confidentiality: Optional[str] = None
+    language: str = "en"
+    page_count: int = 0
+    tags: List[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+    extraction_confidence: float = 0.0
+    user_overrides: Dict[str, bool] = Field(default_factory=dict)
+    last_edited_at: Optional[str] = None
+
+
+class DocumentMetaUpdate(BaseModel):
+    """User-editable metadata fields."""
+    company_name: Optional[str] = None
+    document_type: Optional[str] = None
+    project_code: Optional[str] = None
+    as_of_date: Optional[str] = None
+    period_label: Optional[str] = None
+    publish_date: Optional[str] = None
+    sector: Optional[str] = None
+    geography: Optional[str] = None
+    tags: Optional[List[str]] = None
+    notes: Optional[str] = None
+
+
+class FacetsResponse(BaseModel):
+    """Distinct values for filter dropdowns."""
+    companies: List[str]
+    sectors: List[str]
+    document_types: List[str]
+    projects: List[str]
+
+
+class BatchRequest(BaseModel):
+    """Batch operation on multiple documents."""
+    doc_hashes: List[str] = Field(..., max_length=100, description="Max 100 documents per batch")
+    action: str  # "tag", "delete", "re_extract"
+    tags: Optional[List[str]] = Field(None, max_length=50)

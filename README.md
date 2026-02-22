@@ -60,8 +60,8 @@ Most RAG systems treat documents as flat text. Financial documents aren't flat t
     │   ┌───────────────────────────────────────┐                     │
     │   │  Saved Prompts (Jinja2 + versioning)  │                     │
     │   │  Workflow Chains (sequential + HITL)   │                     │
-    │   │  4 Exec Modes (RAG/Structured/Direct/ │                     │
-    │   │  SQL) with retrieval caching           │                     │
+    │   │  Context × Output: MECE 2-axis exec   │                     │
+    │   │  Agent Tools (MCP Phase 2)            │                     │
     │   └───────────────────────────────────────┘                     │
     │                                                                 │
     └──────────────────┼──────────────────────────────────────────────┘
@@ -115,6 +115,19 @@ Both helices produce a `UnifiedDocument` — a typed stream of discriminated uni
 | `FinancialTableItem` | HTML table with row hierarchy and accounting basis | Table search, Docling-sourced structured data |
 | `VisualItem` | Chart title, summary, and `MetricSeries[]` | Numeric search, analytics, citations |
 | `ChartTableItem` | Hybrid chart-table artifacts (Football Fields) | Dual-mode retrieval |
+
+### Document-Level Metadata Extraction
+
+After parsing, a lightweight metadata extraction step classifies each document using a 3-tier strategy:
+
+| Tier | Fields | Method | Cost |
+|------|--------|--------|------|
+| **Deterministic** | `page_count`, `currency`, `language`, `confidentiality` | Code analysis of extracted items | Free |
+| **VLM-assisted** | `company_name`, `document_type`, `sector`, `geography`, `as_of_date`, `period_label` | GPT-4.1-mini with first 2 page images | ~$0.01/doc |
+
+Metadata is stored in a separate `document_meta` table (not the `document_ledger`) for clean separation of ingestion state vs semantic metadata. User edits are tracked via a `user_overrides` JSON field — re-ingestion respects manual overrides and only updates auto-extracted fields.
+
+**Document type taxonomy** spans Company (earnings_slides, cim, 10k...), Deal (lender_presentation, term_sheet...), Market (industry_report, comp_sheet...), and Macro (economic_report, central_bank...) categories.
 
 ---
 
@@ -314,9 +327,9 @@ A four-panel Next.js 16 application built on **Zustand** state management with *
 
 | Panel | Component | Function |
 |-------|-----------|----------|
-| **Left Sidebar** | `DocumentList` | CENTAUR wordmark with status dot, document list with upload + drag-and-drop, SSE ingestion progress, collapsible (`PanelLeftClose`) |
+| **Left Sidebar** | `DocumentList` | CENTAUR wordmark with status dot, virtualized document list with fuzzy search, facet filters, multi-select, resizable sidebar, upload + SSE ingestion progress |
 | **Center** | `DocumentViewer` | react-pdf renderer with floating zoom HUD (Ctrl+scroll), active citation bbox overlay, toolbar with page nav + sidebar toggle. Shows `WelcomeDropzone` when no document selected. |
-| **Right** | `RightPanel` | Segmented tab control (sliding indicator) hosting 4 sub-panels |
+| **Right** | `RightPanel` | Segmented tab control (sliding indicator) hosting 5 sub-panels |
 
 ### Right Panel Tabs
 
@@ -326,6 +339,7 @@ A four-panel Next.js 16 application built on **Zustand** state management with *
 | **Inspect** | `ChunkInspectorPanel` | Per-page chunk browser with type badges (visual/narrative/table), metadata inspector, value_bboxes count |
 | **Explorer** | `MetricExplorerPanel` | Structured metric ledger — page-grouped or flat table view, sortable columns, series parser with sparkline previews, TSV export |
 | **Studio** | `StudioPanel` + `WorkflowBuilder` | Prompt library with Jinja2 editor, version history, test run with retrieval caching, workflow chain builder with HITL approval |
+| **Metadata** | `MetadataPanel` | Document-level metadata inspector with AUTO/EDITED field badges, VLM-extracted classification, user-editable overrides, tag management |
 
 ### State Management
 
@@ -333,7 +347,7 @@ Five Zustand stores replace the original `useState` variables, each subscribed b
 
 | Store | State | Subscribers |
 |-------|-------|-------------|
-| `useDocStore` | `documents[]`, `selectedDocHash`, `selectedFilename` | DocumentList, ChatPanel, page.tsx |
+| `useDocStore` | `documents[]`, `selectedDocHash`, `filters`, `sortKey`, `multiSelected`, `facets` | DocumentList, ChatPanel, MetadataPanel, page.tsx |
 | `useViewerStore` | `currentPage`, `numPages`, `zoomScale`, `renderedSize`, `sidebarCollapsed` | DocumentViewer, ChatPanel (citation nav) |
 | `useChatStore` | `messages[]`, `isThinking`, `docScope`, `citations`, `activeCitationIndex` | ChatPanel, BboxOverlay |
 | `useInspectStore` | `inspectMode`, `inspectChunks`, `activeChunkId`, `docStats`, `activePanel` | ChunkInspectorPanel, MetricExplorerPanel |
@@ -370,13 +384,14 @@ The last 6 messages are sent as conversation history for multi-turn context. A "
 
 ## Prompt Studio
 
-An integrated prompt engineering and workflow orchestration environment, decoupled from the chat router.
+An integrated prompt engineering and workflow orchestration environment, decoupled from the chat router. Execution is decomposed into two orthogonal MECE axes — **Context Source** (where data comes from) and **Output Format** (how results are shaped) — enabling any valid combination.
 
 ### Saved Prompts
 
 - **Jinja2 templates** with `{{ variable }}` detection and a test-run sandbox
 - **Version history** with publish/draft lifecycle (only published versions appear in workflow step pickers)
-- **Retrieval caching**: First run retrieves from Qdrant and caches context for 5 minutes. Subsequent runs (prompt refinement) skip retrieval and regenerate from cached context. Manual "Re-retrieve" button available.
+- **Retrieval caching**: First run retrieves and caches context for 5 minutes. Subsequent runs (prompt refinement) skip retrieval and regenerate from cached context. Manual "Re-fetch" button available.
+- **Temperature persisted per-version**: Frozen into published snapshots for workflow determinism
 
 ### Workflow Chains
 
@@ -386,14 +401,48 @@ An integrated prompt engineering and workflow orchestration environment, decoupl
 - **Step retry**: Configurable `retry_count` per step with auto-retry on failure
 - **Skip conditions**: Step condition renders to `"skip"` or `"false"` → step skipped
 
-### Four Execution Modes
+### Execution Pipeline: Context Source × Output Format
 
-| Mode | Retrieval | Output | Use Case |
-|------|-----------|--------|----------|
-| `rag` | Qdrant hybrid search | Free text | Standard Q&A |
-| `structured` | Qdrant hybrid search | Pydantic JSON schema | Data extraction |
-| `direct` | None | Free text | Synthesis, reformatting |
-| `sql` | Text-to-SQL | JSON rows | Quantitative queries |
+Two orthogonal axes replace the previous 4 conflated modes:
+
+**Context Source** — where data comes from:
+
+| Source | Description |
+|--------|------------|
+| **DOCUMENTS** | Qdrant hybrid search (semantic + BM25) with reranking |
+| **METRICS DB** | Text-to-SQL over `metric_facts` structured analytics |
+| **NONE** | No retrieval — synthesis, reformatting, direct generation |
+
+**Output Format** — how results are shaped:
+
+| Format | Description |
+|--------|------------|
+| **TEXT** | Free-text LLM response |
+| **JSON** | Structured output validated against a Pydantic schema |
+| **CHART** | Vega-Lite v5 spec generated from SQL results (requires METRICS DB) |
+| **TABLE** | Raw SQL rows returned directly — bypasses LLM entirely (~50ms) |
+
+**Valid Combinations (8 of 12):**
+
+| | TEXT | JSON | CHART | TABLE |
+|---|:---:|:---:|:---:|:---:|
+| **DOCUMENTS** | Y | Y | - | - |
+| **METRICS DB** | Y | Y | Y | Y |
+| **NONE** | Y | Y | - | - |
+
+CHART and TABLE require METRICS DB as the context source (they operate on SQL result rows).
+
+**Search Strategy** — multi-select within DOCUMENTS context:
+
+| Strategy | Effect |
+|----------|--------|
+| **SEMANTIC** | Dense vector search (Cohere embed-v4) + BM25 sparse search |
+| **NUMERIC** | Text-to-SQL retrieval from `metric_facts` |
+| **Both** | Hybrid — merge results from both strategies, deduplicate by chunk ID |
+
+### Agent Tools (Phase 2)
+
+The Tools tab surfaces published prompts and workflows as reusable **AgentTools** — named, described, and iconified functions that can be exposed as MCP server endpoints for external AI agents.
 
 ---
 

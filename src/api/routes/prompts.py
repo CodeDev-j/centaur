@@ -3,18 +3,50 @@ Prompt Library API Routes.
 
 CRUD for saved prompts and immutable prompt versions.
 Execution endpoint uses the decoupled execution service (not chat router).
+
+Schemas use orthogonal axes: context_source × output_format.
+Legacy exec_mode payloads are silently translated via @model_validator.
 """
 
 import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.storage.studio_driver import get_studio_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/prompts", tags=["prompts"])
+
+
+# ══════════════════════════════════════════════════════════════════
+# Legacy Translator
+# ══════════════════════════════════════════════════════════════════
+
+_EXEC_MODE_MAP = {
+    "rag":        {"context_source": "documents",  "output_format": "text"},
+    "structured": {"context_source": "documents",  "output_format": "json"},
+    "direct":     {"context_source": "none",        "output_format": "text"},
+    "sql":        {"context_source": "metrics_db",  "output_format": "table"},
+}
+
+_RETRIEVAL_MODE_MAP = {
+    "qualitative":  ["semantic"],
+    "quantitative": ["numeric"],
+}
+
+
+def _translate_legacy(data: dict) -> dict:
+    """Convert old exec_mode/retrieval_mode payloads to new axes."""
+    if "exec_mode" in data and "context_source" not in data:
+        mapping = _EXEC_MODE_MAP.get(data.pop("exec_mode"), {})
+        data.update(mapping)
+    if "retrieval_mode" in data and "search_strategy" not in data:
+        rm = data.pop("retrieval_mode")
+        if rm in _RETRIEVAL_MODE_MAP:
+            data["search_strategy"] = _RETRIEVAL_MODE_MAP[rm]
+    return data
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -38,10 +70,19 @@ class PromptUpdate(BaseModel):
 class VersionPublish(BaseModel):
     template: str = Field(..., min_length=1)
     variables: List[dict] = Field(default_factory=list)
-    exec_mode: str = Field("rag", pattern="^(rag|structured|direct|sql)$")
+    context_source: str = Field("documents", pattern="^(documents|metrics_db|none)$")
+    output_format: str = Field("text", pattern="^(text|json|chart|table)$")
+    search_strategy: List[str] = Field(default_factory=lambda: ["semantic"])
     output_schema: Optional[dict] = None
     model_id: Optional[str] = None
-    retrieval_mode: Optional[str] = Field(None, pattern="^(qualitative|quantitative)$")
+    temperature: float = Field(0.1, ge=0.0, le=2.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def translate_legacy(cls, data):
+        if isinstance(data, dict):
+            return _translate_legacy(data)
+        return data
 
 
 class PromptSummary(BaseModel):
@@ -58,7 +99,10 @@ class PromptSummary(BaseModel):
 class VersionSummary(BaseModel):
     id: str
     version: int
-    exec_mode: str
+    context_source: str
+    output_format: str
+    search_strategy: Optional[List[str]] = None
+    temperature: Optional[float] = None
     created_at: Optional[str]
     is_published: bool
 
@@ -69,11 +113,13 @@ class VersionDetail(BaseModel):
     version: int
     template: str
     variables: list
-    exec_mode: str
-    output_schema: Optional[dict]
-    model_id: Optional[str]
-    retrieval_mode: Optional[str]
-    created_at: Optional[str]
+    context_source: str
+    output_format: str
+    search_strategy: Optional[List[str]] = None
+    output_schema: Optional[dict] = None
+    model_id: Optional[str] = None
+    temperature: Optional[float] = None
+    created_at: Optional[str] = None
     is_published: bool
 
 
@@ -165,10 +211,12 @@ async def publish_version(prompt_id: str, body: VersionPublish):
         prompt_id=prompt_id,
         template=body.template,
         variables=body.variables,
-        exec_mode=body.exec_mode,
+        context_source=body.context_source,
+        output_format=body.output_format,
+        search_strategy=body.search_strategy,
         output_schema=body.output_schema,
         model_id=body.model_id,
-        retrieval_mode=body.retrieval_mode,
+        temperature=body.temperature,
     )
     if not result:
         raise HTTPException(status_code=404, detail="Prompt not found")
@@ -200,12 +248,29 @@ class PromptRunRequest(BaseModel):
     """Run a prompt template with variables. Does NOT require a published version."""
     template: str = Field(..., min_length=1)
     variables: dict = Field(default_factory=dict)
-    exec_mode: str = Field("rag", pattern="^(rag|structured|direct|sql)$")
+    context_source: str = Field("documents", pattern="^(documents|metrics_db|none)$")
+    output_format: str = Field("text", pattern="^(text|json|chart|table)$")
+    search_strategy: List[str] = Field(default_factory=lambda: ["semantic"])
     output_schema: Optional[dict] = None
-    retrieval_mode: str = "qualitative"
     doc_filter: Optional[str] = None
     model_id: Optional[str] = None
+    temperature: float = Field(0.1, ge=0.0, le=2.0)
     force_retrieve: bool = Field(False, description="Bust retrieval cache and re-fetch chunks")
+
+    @model_validator(mode="before")
+    @classmethod
+    def translate_legacy(cls, data):
+        if isinstance(data, dict):
+            return _translate_legacy(data)
+        return data
+
+    @model_validator(mode="after")
+    def validate_combination(self):
+        if self.output_format in ("chart", "table") and self.context_source != "metrics_db":
+            raise ValueError(f"{self.output_format} output requires metrics_db context source")
+        if self.output_format == "json" and self.output_schema is None:
+            pass  # Allow — schema can be optional for ad-hoc JSON
+        return self
 
 
 class PromptRunResponse(BaseModel):
@@ -224,19 +289,26 @@ async def run_prompt(prompt_id: str, body: PromptRunRequest):
 
     # Bust cache if requested
     if body.force_retrieve:
-        key = _cache_key(prompt_id, body.doc_filter)
+        key = _cache_key(prompt_id, body.doc_filter, body.search_strategy)
         _retrieval_cache.pop(key, None)
 
-    result = await execute_prompt(
-        template=body.template,
-        variables=body.variables,
-        exec_mode=body.exec_mode,
-        output_schema=body.output_schema,
-        retrieval_mode=body.retrieval_mode,
-        doc_filter=body.doc_filter,
-        model_id=body.model_id,
-        prompt_id=prompt_id,
-    )
+    try:
+        result = await execute_prompt(
+            template=body.template,
+            variables=body.variables,
+            context_source=body.context_source,
+            output_format=body.output_format,
+            search_strategy=body.search_strategy,
+            output_schema=body.output_schema,
+            doc_filter=body.doc_filter,
+            model_id=body.model_id,
+            temperature=body.temperature,
+            prompt_id=prompt_id,
+            force_retrieve=body.force_retrieve,
+        )
+    except Exception as e:
+        logger.error(f"Prompt execution failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Execution failed: {e}")
 
     return PromptRunResponse(
         text=result.text,

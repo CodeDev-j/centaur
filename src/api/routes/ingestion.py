@@ -23,7 +23,7 @@ from langsmith import traceable
 
 from src.api.schemas import DocumentSummary
 from src.config import SystemPaths
-from src.storage.db_driver import ledger_db, DocumentLedger
+from src.storage.db_driver import ledger_db, DocumentLedger, DocumentMeta
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["ingestion"])
@@ -323,22 +323,35 @@ async def ingest_status_stream(doc_hash: str):
 
 @router.get("/documents", response_model=List[DocumentSummary])
 async def list_documents():
-    """Returns all documents in the ledger."""
+    """Returns all documents with metadata."""
     if not ledger_db:
         raise HTTPException(status_code=503, detail="Database not available")
 
     try:
         with ledger_db.session() as session:
             docs = session.query(DocumentLedger).all()
-            return [
-                DocumentSummary(
+            result = []
+            for d in docs:
+                summary = DocumentSummary(
                     doc_hash=d.doc_hash,
                     filename=d.filename,
                     status=d.status,
                     upload_date=d.upload_date.isoformat() if d.upload_date else None,
                 )
-                for d in docs
-            ]
+                meta = session.query(DocumentMeta).filter_by(doc_hash=d.doc_hash).first()
+                if meta:
+                    summary.company_name = meta.company_name
+                    summary.document_type = meta.document_type
+                    summary.project_code = meta.project_code
+                    summary.as_of_date = meta.as_of_date.isoformat() if meta.as_of_date else None
+                    summary.period_label = meta.period_label
+                    summary.sector = meta.sector
+                    summary.currency = meta.currency
+                    summary.page_count = meta.page_count
+                    summary.tags = meta.tags or []
+                    summary.extraction_confidence = meta.extraction_confidence
+                result.append(summary)
+            return result
     except Exception as e:
         logger.error(f"Failed to list documents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list documents")

@@ -6,9 +6,11 @@ Initializes the LangGraph workflow and all drivers on startup.
 """
 
 import logging
+import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.config import SystemConfig
 
@@ -20,14 +22,24 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# CORS for frontend (Next.js on localhost:3000)
+# CORS for frontend
+_CORS_ORIGINS = os.getenv("CENTAUR_CORS_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["content-type", "authorization"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Global exception handler — prevents unhandled crashes from leaking tracebacks
+# ---------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 @app.on_event("startup")
@@ -81,8 +93,33 @@ async def startup():
     logger.info("Centaur API ready.")
 
 
+@app.on_event("shutdown")
+async def shutdown():
+    """Gracefully close drivers and connection pools."""
+    logger.info("Shutting down Centaur API...")
+    from src.storage.db_driver import ledger_db
+    from src.api.routes.documents import _vector_driver, _thread_pool
+
+    if _thread_pool:
+        _thread_pool.shutdown(wait=False)
+
+    if _vector_driver and hasattr(_vector_driver, "client"):
+        try:
+            _vector_driver.client.close()
+        except Exception:
+            pass
+
+    if ledger_db and hasattr(ledger_db, "engine"):
+        try:
+            ledger_db.engine.dispose()
+        except Exception:
+            pass
+
+    logger.info("Centaur API shutdown complete.")
+
+
 # Register routes
-from src.api.routes import chat, ingestion, documents, prompts, workflows, audit, export  # noqa: E402
+from src.api.routes import chat, ingestion, documents, prompts, workflows, audit, export, tools  # noqa: E402
 
 app.include_router(chat.router)
 app.include_router(ingestion.router)
@@ -91,6 +128,7 @@ app.include_router(prompts.router)
 app.include_router(workflows.router)
 app.include_router(audit.router)
 app.include_router(export.router)
+app.include_router(tools.router)
 
 
 @app.get("/health")
@@ -99,7 +137,6 @@ async def health():
 
 
 if __name__ == "__main__":
-    import os
     import uvicorn
     SystemConfig._check_defaults()
     uvicorn.run(

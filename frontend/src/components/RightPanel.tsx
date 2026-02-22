@@ -7,6 +7,7 @@ import ChatPanel from "./ChatPanel";
 import ChunkInspectorPanel from "./ChunkInspectorPanel";
 import MetricExplorerPanel from "./MetricExplorerPanel";
 import StudioPanel from "./StudioPanel";
+import MetadataPanel from "./MetadataPanel";
 
 // ─── Panel metadata ──────────────────────────────────────────────────
 
@@ -15,6 +16,7 @@ const PANEL_META: Record<PanelId, { label: string; requiresDoc: boolean }> = {
   inspect: { label: "INSPECT", requiresDoc: true },
   explore: { label: "EXPLORER", requiresDoc: true },
   studio: { label: "STUDIO", requiresDoc: false },
+  meta: { label: "METADATA", requiresDoc: true },
 };
 
 // ─── Toggle Pill ─────────────────────────────────────────────────────
@@ -128,6 +130,7 @@ function PanelColumn({
           {id === "inspect" && <ChunkInspectorPanel />}
           {id === "explore" && <MetricExplorerPanel />}
           {id === "studio" && <StudioPanel />}
+          {id === "meta" && <MetadataPanel />}
         </div>
       </div>
     </>
